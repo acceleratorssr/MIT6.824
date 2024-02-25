@@ -1,48 +1,85 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+	"io"
+	"os"
+	"sort"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
 
+// for sorting by key.
+type ByKey []KeyValue
 
-//
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	OverFlag := false // map和reduce均完成后，置为true,好像也可以不用，直接break
+	for !OverFlag {
+		args := TaskArgs{}
+		reply := TaskReply{}
+		ok := call("Coordinator.GetWork", &args, &reply)
+		// work请求一次拿一个map任务执行，完成后返回ok
+		if ok {
+			if reply.AllDone {
+				fmt.Println("map work over")
+				break
+			}
+
+			intermediate := []KeyValue{}
+			file, err := os.Open(reply.FileName)
+			if err != nil {
+				log.Fatalf("cannot open %v", reply.FileName)
+			}
+			content, err := io.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v", reply.FileName)
+			}
+			file.Close()
+			kva := mapf(reply.FileName, string(content))
+			intermediate = append(intermediate, kva...)
+			sort.Sort(ByKey(intermediate))
+			// 在本地保存intermediate
+
+			args.TaskId = reply.TaskId
+			ok = call("Coordinator.WorkDone", &args, &reply)
+			// TODO 处理失败的情况，开一个go程重复发送
+		} else {
+			fmt.Printf("call failed!\n")
+			OverFlag = true
+		}
+	}
 
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
+	//CallExample()
 }
 
-//
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
-//
 func CallExample() {
 
 	// declare an argument structure.
@@ -67,11 +104,9 @@ func CallExample() {
 	}
 }
 
-//
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
