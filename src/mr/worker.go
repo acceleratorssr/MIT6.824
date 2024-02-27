@@ -1,10 +1,14 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"time"
 )
 import "log"
 import "net/rpc"
@@ -35,39 +39,48 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	OverFlag := false // map和reduce均完成后，置为true,好像也可以不用，直接break
-	for !OverFlag {
+	for {
 		args := TaskArgs{}
 		reply := TaskReply{}
 		ok := call("Coordinator.GetWork", &args, &reply)
 		// work请求一次拿一个map任务执行，完成后返回ok
 		if ok {
-			if reply.AllDone {
-				fmt.Println("map work over")
-				break
-			}
+			switch reply.TaskPhase {
+			case TaskMap:
+				if reply.FileName != "" {
+					MapWorker(mapf, &reply)
+				} else if reply.WorkerStatus == WorkerWaiting {
+					//TODO 暂时暴力停一秒等待
+					time.Sleep(time.Second)
+					//fmt.Println("worker waiting...")
+				}
+			case TaskReduce:
+				if reply.FileNames != nil {
+					ReduceWorker(reducef, &reply)
+				} else if reply.WorkerStatus == WorkerWaiting {
+					time.Sleep(time.Second)
+					//fmt.Println("worker waiting...")
+				}
 
-			intermediate := []KeyValue{}
-			file, err := os.Open(reply.FileName)
-			if err != nil {
-				log.Fatalf("cannot open %v", reply.FileName)
+			default:
+				panic("unhandled default case")
 			}
-			content, err := io.ReadAll(file)
+		}
+		if reply.AllDone {
+			//fmt.Println("work over")
+			files, err := filepath.Glob("mr-out-temp-*")
 			if err != nil {
-				log.Fatalf("cannot read %v", reply.FileName)
+				fmt.Println("匹配文件时出错:", err)
+				return
 			}
-			file.Close()
-			kva := mapf(reply.FileName, string(content))
-			intermediate = append(intermediate, kva...)
-			sort.Sort(ByKey(intermediate))
-			// 在本地保存intermediate
-
-			args.TaskId = reply.TaskId
-			ok = call("Coordinator.WorkDone", &args, &reply)
-			// TODO 处理失败的情况，开一个go程重复发送
-		} else {
-			fmt.Printf("call failed!\n")
-			OverFlag = true
+			// 遍历匹配到的文件列表，逐个删除文件
+			for _, file := range files {
+				err = os.Remove(file)
+				if err != nil {
+					fmt.Printf("删除文件 %s 时出错: %v\n", file, err)
+				}
+			}
+			return
 		}
 	}
 
@@ -75,6 +88,102 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	//CallExample()
+}
+
+func MapWorker(mapf func(string, string) []KeyValue, reply *TaskReply) {
+	intermediate := []KeyValue{}
+	file, err := os.Open(reply.FileName)
+	if err != nil {
+		log.Fatalf("cannot open %v", reply.FileName)
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", reply.FileName)
+	}
+	file.Close()
+	kva := mapf(reply.FileName, string(content))
+	intermediate = append(intermediate, kva...)
+	sort.Sort(ByKey(intermediate))
+
+	// 在本地保存intermediate
+	// 按照key进行分进不同的HashKV桶
+	HashKV := make([][]KeyValue, reply.NReduce)
+	for _, kv := range intermediate {
+		HashKV[ihash(kv.Key)%reply.NReduce] = append(HashKV[ihash(kv.Key)%reply.NReduce], kv)
+	}
+
+	for i := range reply.NReduce {
+		tempName := "mr-out-temp-" + strconv.Itoa(reply.TaskId) + "-" + strconv.Itoa(i)
+		tempFile, _ := os.Create(tempName)
+		// 创建一个JSON编码器，并将其关联到先前创建的文件对象ofile。JSON编码器可以将数据编码为JSON格式并写入到文件中;
+		enc := json.NewEncoder(tempFile)
+		for _, kv := range HashKV[i] {
+			enc.Encode(kv)
+		}
+		tempFile.Close()
+	}
+
+	args := TaskArgs{}
+	args.TaskId = reply.TaskId
+	//fmt.Println("work ok: ", reply.FileName)
+	ok := call("Coordinator.WorkDone", &args, &reply)
+	// TODO 处理失败的情况，开一个go程重复发送
+	if !ok {
+		fmt.Println("mapWorker call error")
+		return
+	}
+}
+
+func ReduceWorker(reducef func(string, []string) string, reply *TaskReply) {
+	var kva []KeyValue
+	for _, file := range reply.FileNames {
+		f, _ := os.Open(file)
+		dec := json.NewDecoder(f)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+	}
+	sort.Sort(ByKey(kva))
+
+	oname := "mr-out-" + strconv.Itoa(reply.TaskId)
+	ofile, _ := os.Create(oname)
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+	ofile.Close()
+
+	args := TaskArgs{}
+	args.TaskId = reply.TaskId
+	//fmt.Println("redecue work ok: ", reply.TaskId)
+	ok := call("Coordinator.WorkDone", &args, &reply)
+	// TODO 处理失败的情况，开一个go程重复发送
+	if !ok {
+		fmt.Println("Worker call error")
+		return
+	}
+}
+
+func SendACK(reply *TaskReply) {
+
 }
 
 // example function to show how to make an RPC call to the coordinator.

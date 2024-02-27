@@ -29,10 +29,15 @@ type TaskArgs struct {
 }
 
 type TaskReply struct {
-	FileName string
-	TaskId   int
-	TaskType int
-	AllDone  bool
+	FileName     string
+	FileNames    []string
+	NReduce      int
+	TaskPhase    int
+	TaskId       int
+	TaskType     int
+	MapDone      bool
+	AllDone      bool
+	WorkerStatus int
 }
 
 // Cook up a unique-ish UNIX-domain socket name
