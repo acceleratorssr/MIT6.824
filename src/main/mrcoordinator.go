@@ -15,6 +15,7 @@ import "os"
 import "fmt"
 
 func main() {
+	startTime := time.Now()
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: mrcoordinator inputfiles...\n")
 		os.Exit(1)
@@ -24,6 +25,7 @@ func main() {
 	for m.Done() == false {
 		time.Sleep(time.Second)
 	}
-
+	elapsedTime := time.Since(startTime)
+	fmt.Println(fmt.Sprintf("mrcoordinator runtime:%s", elapsedTime))
 	time.Sleep(time.Second)
 }
