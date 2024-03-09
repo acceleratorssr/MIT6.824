@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"time"
@@ -47,10 +46,10 @@ func Worker(mapf func(string, string) []KeyValue,
 		if ok {
 			switch reply.TaskPhase {
 			case TaskMap:
-				if reply.FileName != "" {
+				if reply.FileNames != nil {
 					MapWorker(mapf, &reply)
 				} else if reply.WorkerStatus == WorkerWaiting {
-					//TODO 暂时暴力停一秒等待
+					// 暂时暴力停一秒等待
 					time.Sleep(time.Second)
 					//fmt.Println("worker waiting...")
 				}
@@ -67,19 +66,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			}
 		}
 		if reply.AllDone {
-			//fmt.Println("work over")
-			files, err := filepath.Glob("mr-out-temp-*")
-			if err != nil {
-				fmt.Println("匹配文件时出错:", err)
-				return
-			}
-			// 遍历匹配到的文件列表，逐个删除文件
-			for _, file := range files {
-				err = os.Remove(file)
-				if err != nil {
-					fmt.Printf("删除文件 %s 时出错: %v\n", file, err)
-				}
-			}
+			//fmt.Println("All work over")
 			return
 		}
 	}
@@ -91,19 +78,21 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func MapWorker(mapf func(string, string) []KeyValue, reply *TaskReply) {
-	intermediate := []KeyValue{}
-	file, err := os.Open(reply.FileName)
-	if err != nil {
-		log.Fatalf("cannot open %v", reply.FileName)
+	var intermediate []KeyValue
+	for _, fileName := range reply.FileNames {
+		file, err := os.Open(fileName)
+		if err != nil {
+			log.Fatalf("cannot open %v", fileName)
+		}
+		content, err := io.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", fileName)
+		}
+		file.Close()
+		kva := mapf(fileName, string(content))
+		intermediate = append(intermediate, kva...)
+		sort.Sort(ByKey(intermediate))
 	}
-	content, err := io.ReadAll(file)
-	if err != nil {
-		log.Fatalf("cannot read %v", reply.FileName)
-	}
-	file.Close()
-	kva := mapf(reply.FileName, string(content))
-	intermediate = append(intermediate, kva...)
-	sort.Sort(ByKey(intermediate))
 
 	// 在本地保存intermediate
 	// 按照key进行分进不同的HashKV桶
@@ -127,7 +116,6 @@ func MapWorker(mapf func(string, string) []KeyValue, reply *TaskReply) {
 	args.TaskId = reply.TaskId
 	//fmt.Println("work ok: ", reply.FileName)
 	ok := call("Coordinator.WorkDone", &args, &reply)
-	// TODO 处理失败的情况，开一个go程重复发送
 	if !ok {
 		fmt.Println("mapWorker call error")
 		return
@@ -158,7 +146,7 @@ func ReduceWorker(reducef func(string, []string) string, reply *TaskReply) {
 		for j < len(kva) && kva[j].Key == kva[i].Key {
 			j++
 		}
-		values := []string{}
+		var values []string
 		for k := i; k < j; k++ {
 			values = append(values, kva[k].Value)
 		}
@@ -175,7 +163,6 @@ func ReduceWorker(reducef func(string, []string) string, reply *TaskReply) {
 	args.TaskId = reply.TaskId
 	//fmt.Println("redecue work ok: ", reply.TaskId)
 	ok := call("Coordinator.WorkDone", &args, &reply)
-	// TODO 处理失败的情况，开一个go程重复发送
 	if !ok {
 		fmt.Println("Worker call error")
 		return

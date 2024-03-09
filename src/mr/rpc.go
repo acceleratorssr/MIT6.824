@@ -29,13 +29,11 @@ type TaskArgs struct {
 }
 
 type TaskReply struct {
-	FileName     string
 	FileNames    []string
 	NReduce      int
 	TaskPhase    int
 	TaskId       int
 	TaskType     int
-	MapDone      bool
 	AllDone      bool
 	WorkerStatus int
 }

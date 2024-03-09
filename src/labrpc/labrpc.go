@@ -3,8 +3,8 @@ package labrpc
 //
 // channel-based RPC, for 824 labs.
 //
-// simulates a network that can lose requests, lose replies,
-// delay messages, and entirely disconnect particular hosts.
+// simulates a network that can lose requests, lose replies, delay messages, and entirely disconnect particular hosts.
+// 模拟一个可能丢失请求、丢失回复、延迟消息以及完全断开特定主机连接的网络。
 //
 // we will use the original labrpc.go to test your code for grading.
 // so, while you can modify this code to help you debug, please
@@ -12,8 +12,8 @@ package labrpc
 //
 // adapted from Go net/rpc/server.go.
 //
-// sends labgob-encoded values to ensure that RPCs
-// don't include references to program objects.
+// sends labgob-encoded values to ensure that RPCs don't include references to program objects.
+// 发送labgob编码的值以确保RPC不包括对程序对象的引用。
 //
 // net := MakeNetwork() -- holds network, clients, servers.
 // end := net.MakeEnd(endname) -- create a client end-point, to talk to one server.
@@ -379,11 +379,9 @@ func (rn *Network) GetTotalBytes() int64 {
 	return x
 }
 
-//
 // a server is a collection of services, all sharing
 // the same rpc dispatcher. so that e.g. both a Raft
 // and a k/v server can listen to the same rpc endpoint.
-//
 type Server struct {
 	mu       sync.Mutex
 	services map[string]*Service
