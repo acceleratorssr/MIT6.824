@@ -19,6 +19,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	//	"bytes"
 	"sync"
@@ -91,11 +92,11 @@ type Raft struct {
 // GetState return currentTerm，以及此服务器是否认为自己是leader。
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
+	//var term int
+	//var isleader bool
 	// Your code here (2A).
 
-	return term, isleader
+	return rf.CurrentTerm, rf.State == Leader
 }
 
 // 将Raft的持久状态保存到稳定存储中，
@@ -184,17 +185,30 @@ type AppendEntriesReply struct {
 // 如果VotedFor是nil/candidateID，且候选人日志至少和接收人的日志一样新，则投票
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if rf.CurrentTerm > args.Term {
+	if rf.CurrentTerm >= args.Term { // 此时的args.Term已经自增了
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
+		fmt.Printf("%d server, term:%d, votefor:%d", rf.me, rf.CurrentTerm, args.CandidateID)
 	}
-	//TODO follower任期要变
+	// TODO 候选人日志不够新
+	// 即使投false，也要更新到候选人的任期
+
+	//follower任期要变
 	if rf.VotedFor == -1 {
 		rf.VotedFor = args.CandidateID
+		rf.CurrentTerm = args.Term // 更新follower的任期为候选人的任期
+		rf.State = Follower
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = true
 
 		rf.ResetChan <- 1 // 通知ticker重新初始化
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.Entries == nil {
+		// 表示为心跳包
+		rf.ResetChan <- 1 //继续睡眠
 	}
 }
 
@@ -231,39 +245,73 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // you've capitalized all field names in structs passed over RPC,
 // and that the caller passes the address of the reply struct with &, not the struct itself.
 // 如果您在使RPC工作时遇到问题，请检查您是否已将通过RPC传递的结构中的所有字段名大写，并且调用者是否使用&传递回复结构的地址，而不是结构本身。
-func (rf *Raft) sendRequestVote(server int, votesCount *int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+// flag 为true时，胜选变为leader
+func (rf *Raft) sendRequestVote(server int, votesCount *int, flag *sync.Once, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
+		fmt.Println("sendRequestVote -> Call Raft.RequestVote error")
 		return false
 	}
+	// 发出投票请求后，当前候选人的任期如果比follower任期大，则会更新follower任期
 	if reply.VoteGranted {
 		*votesCount++
-	} else if reply.Term > rf.CurrentTerm {
-		rf.CurrentTerm = reply.Term
 	}
 
-	// TODO 胜选
-	if *votesCount > len(rf.peers)/2 {
+	// 胜选
+	if *votesCount > len(rf.peers)/2 && rf.State == Candidate {
 		rf.VotedFor = -1
-		rf.CurrentTerm = args.Term
+		//rf.CurrentTerm == args.Term // 好像不需要
 		rf.State = Leader
-		// TODO 发送心跳包
-
+		flag.Do(func() {
+			fmt.Printf("%d win, term:%d\n", rf.me, rf.CurrentTerm)
+			//发送心跳包
+			go func() {
+				for {
+					time.Sleep(100 * time.Millisecond)
+					rf.sendHeart()
+					//fmt.Printf("%d server, term:%d\n", rf.me, rf.CurrentTerm)
+				}
+			}()
+		})
 	}
 
+	return false
+}
+
+func (rf *Raft) sendHeart() bool {
+	for i := range len(rf.peers) {
+		if i == rf.me {
+			continue
+		}
+		request := AppendEntriesArgs{
+			Term:     rf.CurrentTerm,
+			LeaderID: rf.me,
+			//PrevLogIndex: rf.CommitIndex - 1, // no sure
+			//PrevLogTerm:  rf.CurrentTerm,
+			LeaderCommit: rf.CommitIndex,
+		}
+		response := AppendEntriesReply{}
+		go rf.sendAppendEntries(i, &request, &response)
+	}
+	return true
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if !ok {
+		fmt.Println("sendAppendEntries -> Call Raft.AppendEntries error")
+		return true
+	}
 	return true
 }
 
 // Start the service using Raft (e.g. a k/v server) wants to start agreement on the next command to be appended to Raft's log.
 // 使用Raft的服务（例如，kv服务器）希望开始就要附加到Raft的日志的下一个命令达成一致。
-
 // if this server isn't the leader, returns false. otherwise start the agreement and return immediately.
 // 如果此服务器不是领导者，则返回false。否则，启动协议并立即返回。
-
 // there is no guarantee that this command will ever be committed to the Raft log,
 // since the leader may fail or lose an election.
 // 不能保证这个命令会被提交给拉夫特日志，因为领导人可能会失败或输掉选举。
-
 // even if the Raft instance has been killed, this function should return gracefully.
 // 即使Raft实例已被终止，此函数也应正常返回。
 
@@ -337,22 +385,27 @@ func (rf *Raft) ticker() {
 		randomTime := randomDuration()
 		time.Sleep(randomTime)
 
+		fmt.Printf("%d server, term:%d, i am :%v\n", rf.me, rf.CurrentTerm, rf.State)
 		// 继续睡
-		// // 可能是其他节点的投票请求重置，或者是心跳包重置（voteFor置-1），
+		// 可能是其他节点的投票请求重置，或者是心跳包重置（voteFor置-1），
 		reset := len(rf.ResetChan)
-		if rf.VotedFor != -1 || reset != 0 {
+		if rf.VotedFor != -1 || reset != 0 || rf.State == Leader {
 			<-rf.ResetChan
 			continue
 		}
 
+		// 任期号自增
+		rf.CurrentTerm++
 		args := RequestVoteArgs{
-			Term:         rf.CurrentTerm, //TODO 这里应该增加++？
+			Term:         rf.CurrentTerm,
 			CandidateID:  rf.me,
 			LastLogIndex: rf.CommitIndex,
 			LastLogTerm:  rf.CurrentTerm,
 		}
 		reply := RequestVoteReply{}
 		rf.VotedFor = rf.me // 投给自己
+		rf.State = Candidate
+		fmt.Printf("%d server, term:%d, start vote", rf.me, rf.CurrentTerm)
 		VotesCount := 1
 		for i := range len(rf.peers) {
 			if i == rf.me {
@@ -361,7 +414,8 @@ func (rf *Raft) ticker() {
 			//go func(num int) {
 			//	rf.sendRequestVote(num, &args, &reply)
 			//}(i)
-			go rf.sendRequestVote(i, &VotesCount, &args, &reply)
+			var flag sync.Once
+			go rf.sendRequestVote(i, &VotesCount, &flag, &args, &reply)
 		}
 	}
 }
@@ -389,16 +443,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.CurrentTerm = 0
+	rf.CurrentTerm = 1 //不是应该初始化为0吗
 	rf.VotedFor = -1
 	rf.CommitIndex = 0
 	rf.LastApplied = 0
 
 	rf.State = Follower
-	rf.ResetChan = make(chan int, 1)
+	rf.ResetChan = make(chan int, 5)
 	// initialize from state persisted before a crash
 	// 从崩溃前保持的状态初始化
 	rf.readPersist(persister.ReadRaftState())
+
+	fmt.Printf("%d server, term:%d\n", rf.me, rf.CurrentTerm)
 
 	// start ticker goroutine to start elections
 	// 启动ticker goroutine启动选举
