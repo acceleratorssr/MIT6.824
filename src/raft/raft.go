@@ -209,6 +209,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Entries == nil {
 		// 表示为心跳包
 		rf.ResetChan <- 1 //继续睡眠
+		rf.VotedFor = -1
 	}
 }
 
@@ -299,7 +300,7 @@ func (rf *Raft) sendHeart() bool {
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
-		fmt.Println("sendAppendEntries -> Call Raft.AppendEntries error")
+		fmt.Printf("sendAppendEntries -> Call Raft.AppendEntries error, server %d to %d\n", rf.me, server)
 		return true
 	}
 	return true
@@ -391,9 +392,12 @@ func (rf *Raft) ticker() {
 		reset := len(rf.ResetChan)
 		if rf.VotedFor != -1 || reset != 0 || rf.State == Leader {
 			<-rf.ResetChan
+			fmt.Println("Reset:", reset)
+			fmt.Println(rf.VotedFor)
 			continue
 		}
 
+		fmt.Printf("%d server, term:%d, start vote\n", rf.me, rf.CurrentTerm)
 		// 任期号自增
 		rf.CurrentTerm++
 		args := RequestVoteArgs{
@@ -405,7 +409,7 @@ func (rf *Raft) ticker() {
 		reply := RequestVoteReply{}
 		rf.VotedFor = rf.me // 投给自己
 		rf.State = Candidate
-		fmt.Printf("%d server, term:%d, start vote", rf.me, rf.CurrentTerm)
+
 		VotesCount := 1
 		for i := range len(rf.peers) {
 			if i == rf.me {
