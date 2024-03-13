@@ -62,6 +62,12 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntries struct {
+	LogID   int
+	TermID  int
+	Command interface{}
+}
+
 // Raft 实现单个Raft对等体的Go对象。
 type Raft struct {
 	mu        sync.Mutex          // 锁定以保护对此对等状态的共享访问
@@ -73,9 +79,9 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// 请参阅本文的图2，了解Raft服务器必须保持的状态。
 	// 响应RPC前，在持久性存储
-	CurrentTerm int   // 服务器看到的最新任期（首次启动时初始化为0，单调增加）
-	VotedFor    int   // 当前任期获得选票的候选人ID（如果没有则为空）
-	Log         []int // 日志条目：每个日志条目包含状态机的命令，以及领导者收到条目的时间（第一个索引为1）
+	CurrentTerm int          // 服务器看到的最新任期（首次启动时初始化为0，单调增加）
+	VotedFor    int          // 当前任期获得选票的候选人ID（如果没有则为空）
+	Log         []LogEntries // 日志条目：每个日志条目包含状态机的命令，以及领导者收到条目的时间（第一个索引为1）
 
 	// 易失性状态
 	CommitIndex int // 已知被提交的最高日志条目的索引（初始化为0，单调增加）
@@ -167,12 +173,12 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term         int   // leader当前任期
-	LeaderID     int   // 使follower可以找到leader，为clients重定向
-	PrevLogIndex int   // 紧接着新日志之前的日志条目的索引
-	PrevLogTerm  int   // 紧接着新日志之前的日志条目的任期
-	Entries      []int // 需要被保存的日志条目（心跳包的内容为空，运行一次发送多个）
-	LeaderCommit int   // leader已知已提交的最高日志条目的索引
+	Term         int          // leader当前任期
+	LeaderID     int          // 使follower可以找到leader，为clients重定向
+	PrevLogIndex int          // 紧接着新日志之前的日志条目的索引
+	PrevLogTerm  int          // 紧接着新日志之前的日志条目的任期
+	Entries      []LogEntries // 需要被保存的日志条目（心跳包的内容为空，运行一次发送多个）
+	LeaderCommit int          // leader已知已提交的最高日志条目的索引
 }
 
 type AppendEntriesReply struct {
@@ -190,8 +196,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		fmt.Printf("%d server, term:%d, votefor:%d", rf.me, rf.CurrentTerm, args.CandidateID)
 	}
-	// TODO 候选人日志不够新
+
+	// 候选人日志不够新
 	// 即使投false，也要更新到候选人的任期
+	if args.LastLogIndex < rf.CommitIndex {
+		rf.CurrentTerm = args.Term
+		reply.Term = rf.CurrentTerm
+		reply.VoteGranted = false
+	}
 
 	//follower任期要变
 	if rf.VotedFor == -1 {
@@ -206,10 +218,41 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.Term < rf.CurrentTerm {
+		fmt.Printf("节点%d接收到追加日志RPC的任期为:%d, 小于自身当前任期:%d，将无视该RPC\n", rf.me, args.Term, rf.CurrentTerm)
+		reply.Term = rf.CurrentTerm
+		reply.Success = false
+	}
+	// 已提交的日志不够新
+	if rf.CommitIndex > args.LeaderCommit {
+		rf.CommitIndex = args.LeaderCommit
+		reply.Term = rf.CurrentTerm
+		reply.Success = false
+	}
 	if args.Entries == nil {
+		// 如果此时节点还是candidate时,收到新leader心跳包,且其任期大于等于自己,则会转变回follower
+		if rf.State == Candidate && rf.CurrentTerm <= args.Term {
+			rf.State = Follower
+		}
 		// 表示为心跳包
-		rf.ResetChan <- 1 //继续睡眠
-		rf.VotedFor = -1
+		rf.ResetChan <- 1                       // 继续睡眠
+		rf.VotedFor = -1                        // 暂时在收到心跳包后重置投票
+		if args.LeaderCommit > rf.CommitIndex { // follower提交日志
+			rf.CommitIndex = args.LeaderCommit
+		}
+		reply.Term = rf.CurrentTerm
+		reply.Success = true
+	} else {
+		if args.PrevLogIndex != len(rf.Log)-1 {
+			//TODO 追加日志条件
+		}
+		for _, v := range args.Entries {
+			rf.Log[len(rf.Log)] = v
+		}
+
+		rf.ResetChan <- 1 // 继续睡眠
+		reply.Term = rf.CurrentTerm
+		reply.Success = true
 	}
 }
 
@@ -285,10 +328,10 @@ func (rf *Raft) sendHeart() bool {
 			continue
 		}
 		request := AppendEntriesArgs{
-			Term:     rf.CurrentTerm,
-			LeaderID: rf.me,
-			//PrevLogIndex: rf.CommitIndex - 1, // no sure
-			//PrevLogTerm:  rf.CurrentTerm,
+			Term:         rf.CurrentTerm,
+			LeaderID:     rf.me,
+			PrevLogIndex: rf.CommitIndex - 1, // no sure
+			PrevLogTerm:  rf.Log[rf.CommitIndex-1].TermID,
 			LeaderCommit: rf.CommitIndex,
 		}
 		response := AppendEntriesReply{}
@@ -320,13 +363,37 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the first return value is the index that the command will appear at if it's ever committed.
 // 第一个返回值是如果命令被提交，它将出现在的索引。
 // the second return value is the current term.
-// 第二个返回值是当前项。
+// 第二个返回值是当前任期。
 // the third return value is true if this server believes it is the leader.
 // 如果此服务器认为它是领导者，则第三个返回值为true。
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	term, isLeader := rf.GetState()
+	index := rf.CommitIndex
+	// 这里没写重定向到leader
+	if !isLeader {
+		return index, term, isLeader
+	}
+	// leader
+	for server, i := range rf.NextIndex {
+		if server == rf.me {
+			continue
+		}
+		entries := LogEntries{
+			LogID:   rf.NextIndex[i],
+			TermID:  rf.CurrentTerm,
+			Command: command,
+		}
+		args := AppendEntriesArgs{
+			Term:         rf.CurrentTerm,
+			LeaderID:     rf.me,
+			PrevLogIndex: rf.CommitIndex - 1, // no sure
+			PrevLogTerm:  rf.Log[rf.CommitIndex-1].TermID,
+			Entries:      []LogEntries{entries},
+			LeaderCommit: rf.CommitIndex,
+		}
+		reply := AppendEntriesReply{}
+		go rf.sendAppendEntries(server, &args, &reply)
+	}
 
 	// Your code here (2B).
 
@@ -390,7 +457,7 @@ func (rf *Raft) ticker() {
 		// 继续睡
 		// 可能是其他节点的投票请求重置，或者是心跳包重置（voteFor置-1），
 		reset := len(rf.ResetChan)
-		if rf.VotedFor != -1 || reset != 0 || rf.State == Leader {
+		if reset != 0 || rf.State == Leader {
 			<-rf.ResetChan
 			fmt.Println("Reset:", reset)
 			fmt.Println(rf.VotedFor)
@@ -414,6 +481,10 @@ func (rf *Raft) ticker() {
 		for i := range len(rf.peers) {
 			if i == rf.me {
 				continue
+			}
+			// 收到新leader心跳包,且其任期大于等于自己,则会转变回follower,终止自己的candidate状态；
+			if rf.State != Candidate {
+				return
 			}
 			//go func(num int) {
 			//	rf.sendRequestVote(num, &args, &reply)
@@ -453,7 +524,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.LastApplied = 0
 
 	rf.State = Follower
-	rf.ResetChan = make(chan int, 5)
+	rf.ResetChan = make(chan int, 10)
 	// initialize from state persisted before a crash
 	// 从崩溃前保持的状态初始化
 	rf.readPersist(persister.ReadRaftState())
