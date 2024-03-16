@@ -222,6 +222,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	//rf.Log = append(rf.Log, LogEntries{}) // 防止follower越界
 
+	// TODO 如果反对投票，follower任期大于leader,leader直接下岗,然后任一节点超时发起选举，有最新已提交日志的才有可能胜选
 	// 如果term < currentTerm，则返回false
 	if args.Term < rf.CurrentTerm {
 		fmt.Printf("节点%d接收到追加日志RPC的任期为:%d, 小于自身当前任期:%d，将无视该RPC\n", rf.me, args.Term, rf.CurrentTerm)
@@ -230,20 +231,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	//// 如果日志在prevLogIndex处不包含term与prevLogTerm匹配的条目，则返回false；
-	//if args.PrevLogTerm != rf.Log[args.PrevLogIndex].TermID {
-	//	fmt.Printf("日志在prevLogIndex:%d 处不包含term:%d 与prevLogTerm:%d 匹配的条目\n", args.PrevLogIndex, rf.Log[args.PrevLogIndex].TermID, args.PrevLogTerm)
-	//	reply.Term = rf.CurrentTerm
-	//	reply.Success = false
-	//	return
-	//}
+	// 如果日志在prevLogIndex处不包含term与prevLogTerm匹配的条目，则返回false；
+	if args.PrevLogTerm != rf.Log[args.PrevLogIndex].TermID {
+		fmt.Printf("日志在prevLogIndex:%d 处不包含term:%d 与prevLogTerm:%d 匹配的条目\n", args.PrevLogIndex, rf.Log[args.PrevLogIndex].TermID, args.PrevLogTerm)
+		reply.Term = rf.CurrentTerm
+		reply.Success = false
+		return
+	}
 
-	//// 如果一个现有的条目与一个新的条目相冲突（相同索引但是不同任期），则删除现有条目和后面所有条目
-	//if args.PrevLogIndex+1 <= len(rf.Log)-1 {
-	//	for i, _ := range rf.Log {
-	//		rf.Log[i+args.PrevLogIndex+1] = LogEntries{}
-	//	}
-	//}
+	// 如果一个现有的条目与一个新的条目相冲突（相同索引但是不同任期），则删除现有条目和后面所有条目
+	if len(rf.Log)-1 > args.PrevLogIndex && args.Term != rf.Log[args.PrevLogIndex+1].TermID {
+		rf.Log = rf.Log[:args.PrevLogIndex+1]
+		fmt.Printf("server:%d 一个现有的条目%d 与一个新的条目%d 相冲突\n", rf.me, len(rf.Log)-1, args.PrevLogIndex+1)
+		fmt.Printf("server:%d log:%v\n", rf.me, rf.Log)
+	}
 
 	if args.Entries == nil {
 		// 如果此时节点还是candidate时,收到新leader心跳包,且其任期大于等于自己,则会转变回follower
@@ -268,14 +269,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.Log = append(rf.Log, v)
 		}
 		fmt.Printf("follower:%d getLog:%d\n", rf.me, args.PrevLogIndex+1)
-
+		fmt.Printf("server:%d log:%v\n", rf.me, rf.Log)
 		rf.ResetChan <- 1 // 继续睡眠
 		reply.Term = rf.CurrentTerm
 		reply.Success = true
 	}
 
 	if args.LeaderCommit > rf.CommitIndex { // follower提交日志
-		rf.CommitIndex = args.LeaderCommit
+		rf.CommitIndex = min(args.LeaderCommit, len(rf.Log))
 		rf.LastApplied = rf.CommitIndex // 暂时直接提交及应用
 		fmt.Printf("follower:%d update lodCommitIndex:%d\n", rf.me, rf.CommitIndex)
 		applyMsg := ApplyMsg{
@@ -328,6 +329,7 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, flag *sync.Once, ar
 		fmt.Println("sendRequestVote -> Call Raft.RequestVote error")
 		return false
 	}
+	fmt.Printf("server:%d, term:%d, commitIndex:%d\n", rf.me, rf.CurrentTerm, rf.CommitIndex)
 	// 发出投票请求后，当前候选人的任期如果比follower任期大，则会更新follower任期
 	if reply.VoteGranted {
 		*votesCount++
@@ -365,6 +367,8 @@ func (rf *Raft) sendHeartOrAppend() bool {
 		if i == rf.me {
 			continue
 		}
+		//
+
 		// 日志在leader是1开始，在follower是1开始
 		request := AppendEntriesArgs{
 			Term:         rf.CurrentTerm,
@@ -451,7 +455,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// 这里没写重定向到leader
 	if !isLeader {
 		fmt.Printf("follower:%d return CommitIndex:%d\n", rf.me, rf.CommitIndex)
-		return -1, term, isLeader //-1
+		return index + 1, term, isLeader //-1
 	}
 
 	fmt.Println("find leader")
@@ -469,13 +473,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		entries.LogID = rf.NextIndex[server] //是索引，或者直接用值代替
 
-		fmt.Printf("Leader:%d send log to follower:%d, logIndex:%d\n", rf.me, server, rf.NextIndex[server])
+		fmt.Printf("Leader:%d send log to follower:%d, logIndex:%d\n", rf.me, server, rf.NextIndex[server]) // 新的nextIndex从1开始
 
 		args := AppendEntriesArgs{
-			Term:         rf.CurrentTerm,
-			LeaderID:     rf.me,
-			PrevLogIndex: rf.NextIndex[server] - 1,
-			PrevLogTerm:  rf.Log[rf.NextIndex[server]-1].TermID,
+			Term:     rf.CurrentTerm,
+			LeaderID: rf.me,
+			//PrevLogIndex: rf.NextIndex[server] - 1, // 错误
+			//PrevLogTerm:  rf.Log[rf.NextIndex[server]-1].TermID, // 错误
+			PrevLogIndex: len(rf.Log) - 2,
+			PrevLogTerm:  rf.Log[len(rf.Log)-2].TermID,
 			Entries:      []LogEntries{entries},
 			LeaderCommit: rf.CommitIndex,
 		}
