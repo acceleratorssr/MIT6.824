@@ -68,6 +68,11 @@ type LogEntries struct {
 	Command interface{}
 }
 
+type LogSuccessCount struct {
+	SuccessCount map[int]int
+	LogIndex     int
+}
+
 // Raft 实现单个Raft对等体的Go对象。
 type Raft struct {
 	mu        sync.Mutex          // 锁定以保护对此对等状态的共享访问
@@ -103,7 +108,8 @@ func (rf *Raft) GetState() (int, bool) {
 	//var term int
 	//var isLeader bool
 	// Your code here (2A).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.CurrentTerm, rf.State == Leader
 }
 
@@ -196,7 +202,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.CurrentTerm >= args.Term { // 此时的args.Term已经自增了
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
-		fmt.Printf("%d server, term:%d, votefor:%d\n", rf.me, rf.CurrentTerm, args.CandidateID)
+		return
+		//fmt.Printf("%d server, term:%d, votefor:%d\n", rf.me, rf.CurrentTerm, args.CandidateID)
 	}
 
 	// 候选人日志不够新
@@ -205,7 +212,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.CurrentTerm = args.Term
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
+		if rf.State == Leader {
+			rf.State = Follower
+		}
+		fmt.Printf("server:%d 接收到节点:%d的投票请求，它的任期为:%d，最新日志索引为:%d，任期大于当前任期，但是日志不是最新的，故拒绝投票\n", rf.me, args.CandidateID, args.Term, args.LastLogIndex)
+		return
 	}
+	// TODO 如果反对投票，follower任期大于leader,leader直接下岗,然后任一节点超时发起选举，有最新已提交日志的才有可能胜选
+	//if args.Term > rf.CurrentTerm && args.LastLogIndex < rf.CommitIndex {
+	//	rf.CurrentTerm = args.Term
+	//	reply.Term = rf.CurrentTerm
+	//	reply.VoteGranted = false
+	//}
 
 	//follower任期要变
 	if rf.VotedFor == -1 {
@@ -222,29 +240,37 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	//rf.Log = append(rf.Log, LogEntries{}) // 防止follower越界
 
-	// TODO 如果反对投票，follower任期大于leader,leader直接下岗,然后任一节点超时发起选举，有最新已提交日志的才有可能胜选
 	// 如果term < currentTerm，则返回false
 	if args.Term < rf.CurrentTerm {
-		fmt.Printf("节点%d接收到追加日志RPC的任期为:%d, 小于自身当前任期:%d，将无视该RPC\n", rf.me, args.Term, rf.CurrentTerm)
+		fmt.Printf("server:%d接收到追加日志RPC的任期为:%d, 小于自身当前任期:%d，将无视该RPC\n", rf.me, args.Term, rf.CurrentTerm)
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
+		return
+	} else if args.Term > rf.CurrentTerm { // 即使拒绝心跳包，也要更新自己的任期为: max（peers发送的, 自己的）
+		fmt.Printf("server:%d任期小于appendRPC的任期\n", rf.me)
+		rf.CurrentTerm = args.Term
+		reply.Term = rf.CurrentTerm
+		reply.Success = false
+		if rf.State == Leader {
+			rf.State = Follower
+		}
 		return
 	}
 
 	// 如果日志在prevLogIndex处不包含term与prevLogTerm匹配的条目，则返回false；
-	if args.PrevLogTerm != rf.Log[args.PrevLogIndex].TermID {
+	if args.PrevLogIndex > len(rf.Log)-2 && args.PrevLogTerm != rf.Log[args.PrevLogIndex].TermID {
 		fmt.Printf("日志在prevLogIndex:%d 处不包含term:%d 与prevLogTerm:%d 匹配的条目\n", args.PrevLogIndex, rf.Log[args.PrevLogIndex].TermID, args.PrevLogTerm)
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
 		return
 	}
 
-	// 如果一个现有的条目与一个新的条目相冲突（相同索引但是不同任期），则删除现有条目和后面所有条目
-	if len(rf.Log)-1 > args.PrevLogIndex && args.Term != rf.Log[args.PrevLogIndex+1].TermID {
-		rf.Log = rf.Log[:args.PrevLogIndex+1]
-		fmt.Printf("server:%d 一个现有的条目%d 与一个新的条目%d 相冲突\n", rf.me, len(rf.Log)-1, args.PrevLogIndex+1)
-		fmt.Printf("server:%d log:%v\n", rf.me, rf.Log)
-	}
+	//// 如果一个现有的条目与一个新的条目相冲突（相同索引但是不同任期），则删除现有条目和后面所有条目
+	//if len(rf.Log)-1 > args.PrevLogIndex+1 && args.Term != rf.Log[args.PrevLogIndex+1].TermID {
+	//	rf.Log = rf.Log[:args.PrevLogIndex+1]
+	//	fmt.Printf("server:%d 一个现有的条目%d 与一个新的条目%d 相冲突\n", rf.me, len(rf.Log)-1, args.PrevLogIndex+1)
+	//	fmt.Printf("server:%d log:%v\n", rf.me, rf.Log)
+	//}
 
 	if args.Entries == nil {
 		// 如果此时节点还是candidate时,收到新leader心跳包,且其任期大于等于自己,则会转变回follower
@@ -276,8 +302,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.LeaderCommit > rf.CommitIndex { // follower提交日志
-		rf.CommitIndex = min(args.LeaderCommit, len(rf.Log))
-		rf.LastApplied = rf.CommitIndex // 暂时直接提交及应用
+		rf.CommitIndex = min(args.LeaderCommit, len(rf.Log)-1) // 0不是日志，从1开始
+		rf.LastApplied = rf.CommitIndex                        // 暂时直接提交及应用
 		fmt.Printf("follower:%d update lodCommitIndex:%d\n", rf.me, rf.CommitIndex)
 		applyMsg := ApplyMsg{
 			CommandValid: true,
@@ -285,7 +311,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			CommandIndex: rf.CommitIndex,
 		}
 		rf.ApplyMsg <- applyMsg
-		fmt.Println("follower:", rf.Log)
+		fmt.Printf("follower:%d %v\n", rf.me, rf.Log)
+		reply.Term = rf.CurrentTerm
+		reply.Success = true
 	}
 }
 
@@ -326,12 +354,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendRequestVote(server int, votesCount *int, flag *sync.Once, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
-		fmt.Println("sendRequestVote -> Call Raft.RequestVote error")
+		fmt.Printf("sendRequestVote -> Call Raft.RequestVote error, server:%d to %d\n", rf.me, server)
 		return false
 	}
 	fmt.Printf("server:%d, term:%d, commitIndex:%d\n", rf.me, rf.CurrentTerm, rf.CommitIndex)
 	// 发出投票请求后，当前候选人的任期如果比follower任期大，则会更新follower任期
 	if reply.VoteGranted {
+		fmt.Printf("server:%d 获取到server:%d的选票\n", rf.me, server)
 		*votesCount++
 	}
 
@@ -341,7 +370,7 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, flag *sync.Once, ar
 		//rf.CurrentTerm == args.Term // 好像不需要
 		rf.NextIndex = make([]int, len(rf.peers))
 		for i := range rf.NextIndex {
-			rf.NextIndex[i] = 1
+			rf.NextIndex[i] = rf.CommitIndex + 1
 		}
 		rf.MatchIndex = make([]int, len(rf.peers))
 
@@ -351,7 +380,7 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, flag *sync.Once, ar
 			//发送心跳包
 			go func() {
 				for {
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(200 * time.Millisecond)
 					rf.sendHeartOrAppend()
 					//fmt.Printf("%d server, term:%d\n", rf.me, rf.CurrentTerm)
 				}
@@ -362,31 +391,71 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, flag *sync.Once, ar
 	return false
 }
 
+// leader
 func (rf *Raft) sendHeartOrAppend() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	var flag sync.Once
+	var logSuccessCount LogSuccessCount
 	for i := range len(rf.peers) {
 		if i == rf.me {
 			continue
 		}
-		//
+
+		//// 当所有节点均同步完成时，leader的len(log)等于follower的nextIndex
+		//// 如果有新日志需要同步
+		//if len(rf.Log) > rf.NextIndex[i] {
+		//	entries = LogEntries{
+		//		LogID:   rf.NextIndex[i],
+		//		TermID:  rf.CurrentTerm,
+		//		Command: rf.Log[rf.NextIndex[i]].Command,
+		//	}
+		//}
 
 		// 日志在leader是1开始，在follower是1开始
-		request := AppendEntriesArgs{
+		args := AppendEntriesArgs{
 			Term:         rf.CurrentTerm,
 			LeaderID:     rf.me,
 			PrevLogIndex: rf.NextIndex[i] - 1,
 			PrevLogTerm:  rf.Log[rf.NextIndex[i]-1].TermID,
+			//Entries:      []LogEntries{entries},
 			LeaderCommit: rf.CommitIndex,
 		}
+		reply := AppendEntriesReply{}
 
-		response := AppendEntriesReply{}
+		if args.PrevLogIndex < len(rf.Log)-1 {
+			var entries LogEntries
 
-		go rf.sendAppendEntries(i, nil, nil, &request, &response)
+			//temp := 1
+			// 当前leader已经接收到日志，该日志的index 等于 follower期望同步的index
+			logSuccessCount = LogSuccessCount{
+				LogIndex: rf.NextIndex[i],
+			}
+			logSuccessCount.SuccessCount = make(map[int]int, 5)
+
+			fmt.Printf("server:%d, 日志落后，现在可能需要日志:%d\n", i, rf.NextIndex[i])
+			entries = LogEntries{
+				LogID:   rf.NextIndex[i],
+				TermID:  rf.Log[rf.NextIndex[i]].TermID,
+				Command: rf.Log[rf.NextIndex[i]].Command,
+			}
+			args.Entries = []LogEntries{entries}
+			fmt.Printf("Leader:%d send log to follower:%d, logIndex:%d\n", rf.me, i, rf.NextIndex[i]) // 新的nextIndex从1开始
+			//go rf.sendAppendEntries(i, &logSuccessCount, &flag, &args, &reply)
+			go rf.sendAppendEntries(i, &logSuccessCount, &flag, &args, &reply)
+			continue
+		}
+
+		go rf.sendAppendEntries(i, nil, nil, &args, &reply)
 	}
 	return true
 }
 
 // leader
-func (rf *Raft) sendAppendEntries(server int, successCount *int, flag *sync.Once, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (rf *Raft) sendAppendEntries(server int, successCount *LogSuccessCount, flag *sync.Once, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
 		fmt.Printf("sendAppendEntries -> Call Raft.AppendEntries error, server %d to %d\n", rf.me, server)
@@ -394,17 +463,20 @@ func (rf *Raft) sendAppendEntries(server int, successCount *int, flag *sync.Once
 	}
 
 	// TODO follower收到日志后返回true，收到可提交后依然返回false？
-	if reply.Success && successCount != nil {
+	if reply.Success && args.Entries != nil {
 		rf.NextIndex[server]++
 		rf.MatchIndex[server]++
-		*successCount++
-		fmt.Printf("follower:%d reply ok\n", server)
+		successCount.SuccessCount[successCount.LogIndex]++ //TODO 要回收没用的map
+		//*successCount++
+		fmt.Printf("leader:%d get:follower:%d reply:%d ok\n", rf.me, server, args.PrevLogIndex+1)
 	}
 
-	if successCount != nil && *successCount > len(rf.peers)/2 {
+	//fmt.Println("successCount.SuccessCount[successCount.LogIndex]: ", successCount.SuccessCount)
+	if args.Entries != nil && successCount.SuccessCount[successCount.LogIndex] > len(rf.peers)/2 {
 		flag.Do(func() {
-			fmt.Println("leader set:", args.PrevLogIndex+1)
 			rf.CommitIndex++
+			fmt.Println("leader commitIndex:", rf.CommitIndex)
+
 			rf.LastApplied++ // 暂时直接提交及应用
 			fmt.Println("leader:", rf.Log)
 			applyMsg := ApplyMsg{
@@ -417,18 +489,15 @@ func (rf *Raft) sendAppendEntries(server int, successCount *int, flag *sync.Once
 	}
 
 	// TODO 返回false的处理
-	//if !reply.Success {
-	//	request := AppendEntriesArgs{
-	//		Term:         rf.CurrentTerm,
-	//		LeaderID:     rf.me,
-	//		PrevLogIndex: rf.CommitIndex - 1, // no sure
-	//		PrevLogTerm:  rf.Log[rf.CommitIndex-1].TermID,
-	//		Entries:      []LogEntries{entries},
-	//		LeaderCommit: rf.CommitIndex,
-	//	}
-	//	args.PrevLogIndex--
-	//	args
-	//}
+	if !reply.Success {
+		if reply.Term > rf.CurrentTerm {
+			rf.CurrentTerm = reply.Term
+			if rf.State == Leader {
+				rf.State = Follower
+			}
+		}
+		rf.NextIndex[server]-- // 回退日志
+	}
 	return true
 }
 
@@ -466,32 +535,34 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.Log = append(rf.Log, entries)
 	// leader
-	var flag sync.Once
-	for server, _ := range rf.NextIndex {
-		if server == rf.me {
-			continue
-		}
-		entries.LogID = rf.NextIndex[server] //是索引，或者直接用值代替
-
-		fmt.Printf("Leader:%d send log to follower:%d, logIndex:%d\n", rf.me, server, rf.NextIndex[server]) // 新的nextIndex从1开始
-
-		args := AppendEntriesArgs{
-			Term:     rf.CurrentTerm,
-			LeaderID: rf.me,
-			//PrevLogIndex: rf.NextIndex[server] - 1, // 错误
-			//PrevLogTerm:  rf.Log[rf.NextIndex[server]-1].TermID, // 错误
-			PrevLogIndex: len(rf.Log) - 2,
-			PrevLogTerm:  rf.Log[len(rf.Log)-2].TermID,
-			Entries:      []LogEntries{entries},
-			LeaderCommit: rf.CommitIndex,
-		}
-		reply := AppendEntriesReply{}
-		successCount := 1
-		go rf.sendAppendEntries(server, &successCount, &flag, &args, &reply)
-	}
+	//var flag sync.Once
+	//for server, _ := range rf.NextIndex {
+	//	if server == rf.me {
+	//		continue
+	//	}
+	//	entries.LogID = rf.NextIndex[server] //是索引，或者直接用值代替
+	//
+	//	fmt.Printf("Leader:%d send log to follower:%d, logIndex:%d\n", rf.me, server, rf.NextIndex[server]) // 新的nextIndex从1开始
+	//
+	//	// TODO 如果请求和心跳包两个是不同的发送appendRPC，那么请求有可能返回多次false，导致nextIndex不正常回退
+	//	args := AppendEntriesArgs{
+	//		Term:         rf.CurrentTerm,
+	//		LeaderID:     rf.me,
+	//		PrevLogIndex: rf.NextIndex[server] - 1,              // 错误
+	//		PrevLogTerm:  rf.Log[rf.NextIndex[server]-1].TermID, // 错误
+	//		//PrevLogIndex: len(rf.Log) - 2,
+	//		//PrevLogTerm:  rf.Log[len(rf.Log)-2].TermID,
+	//		Entries:      []LogEntries{entries},
+	//		LeaderCommit: rf.CommitIndex,
+	//	}
+	//
+	//	reply := AppendEntriesReply{}
+	//	successCount := 1
+	//	go rf.sendAppendEntries(server, &successCount, &flag, &args, &reply)
+	//}
 
 	// Your code here (2B).
-	fmt.Printf("leader:%d return CommitIndex:%d\n", rf.me, rf.CommitIndex)
+	//fmt.Printf("leader:%d return CommitIndex:%d\n", rf.me, rf.CommitIndex)
 	return index, term, isLeader
 }
 
@@ -560,7 +631,7 @@ func (rf *Raft) ticker() {
 			}
 			continue
 		}
-
+		rf.mu.Lock()
 		fmt.Printf("%d server, term:%d, start vote\n", rf.me, rf.CurrentTerm)
 		// 任期号自增
 		rf.CurrentTerm++
@@ -576,6 +647,7 @@ func (rf *Raft) ticker() {
 
 		VotesCount := 1
 		var flag sync.Once
+		rf.mu.Unlock()
 		for i := range len(rf.peers) {
 			if i == rf.me {
 				continue
