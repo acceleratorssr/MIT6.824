@@ -108,8 +108,8 @@ func (rf *Raft) GetState() (int, bool) {
 	//var term int
 	//var isLeader bool
 	// Your code here (2A).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
 	return rf.CurrentTerm, rf.State == Leader
 }
 
@@ -199,9 +199,17 @@ type AppendEntriesReply struct {
 // 如果VotedFor是nil/candidateID，且候选人日志至少和接收人的日志一样新，则投票
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	rf.ResetChan <- 1 // 请求投票RPC也会刷新计时，之前忘了加
+	fmt.Printf("server:%d get in RequestRPC\n", rf.me)
+	fmt.Printf("server:%d 曾经投票给:%d\n", rf.me, rf.VotedFor)
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+
 	if rf.CurrentTerm >= args.Term { // 此时的args.Term已经自增了
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
+		fmt.Printf("server:%d 当前任期大于等于请求RPC的任期，故返回false\n", rf.me)
 		return
 		//fmt.Printf("%d server, term:%d, votefor:%d\n", rf.me, rf.CurrentTerm, args.CandidateID)
 	}
@@ -225,20 +233,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//	reply.VoteGranted = false
 	//}
 
-	//follower任期要变
-	if rf.VotedFor == -1 {
+	// follower任期要变
+	// 这里有注意还有第二种情况，
+	// 如果follower没有收到响应（投给某一个candidate后得到的响应），
+	// 那么此时voted在接收到下一个appendRPC前都是已经投票的状态；
+	// 所以避免这种问题，如果下一个投票请求任期高于当前任期，则直接向他投票；
+	if rf.VotedFor == -1 || args.Term > rf.CurrentTerm {
 		rf.VotedFor = args.CandidateID
 		rf.CurrentTerm = args.Term // 更新follower的任期为候选人的任期
 		rf.State = Follower
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = true
-
+		fmt.Printf("server:%d 投票给了:%d\n", rf.me, args.CandidateID)
 		rf.ResetChan <- 1 // 通知ticker重新初始化
 	}
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	//rf.Log = append(rf.Log, LogEntries{}) // 防止follower越界
+	rf.ResetChan <- 1 // 先刷新计时？
 
 	// 如果term < currentTerm，则返回false
 	if args.Term < rf.CurrentTerm {
@@ -253,6 +266,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		if rf.State == Leader {
 			rf.State = Follower
+			fmt.Printf("old leader:%d turn to follower\n", rf.me)
 		}
 		return
 	}
@@ -271,7 +285,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//	fmt.Printf("server:%d 一个现有的条目%d 与一个新的条目%d 相冲突\n", rf.me, len(rf.Log)-1, args.PrevLogIndex+1)
 	//	fmt.Printf("server:%d log:%v\n", rf.me, rf.Log)
 	//}
-
+	rf.VotedFor = -1 // 暂时在收到append包后重置投票
 	if args.Entries == nil {
 		// 如果此时节点还是candidate时,收到新leader心跳包,且其任期大于等于自己,则会转变回follower
 		if rf.State == Candidate && rf.CurrentTerm <= args.Term {
@@ -279,7 +293,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// 表示为心跳包
 		rf.ResetChan <- 1 // 继续睡眠
-		rf.VotedFor = -1  // 暂时在收到心跳包后重置投票
+
+		//fmt.Printf("follower:%d get heart\n", rf.me)
 
 		reply.Term = rf.CurrentTerm
 		reply.Success = true
@@ -297,6 +312,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		fmt.Printf("follower:%d getLog:%d\n", rf.me, args.PrevLogIndex+1)
 		fmt.Printf("server:%d log:%v\n", rf.me, rf.Log)
 		rf.ResetChan <- 1 // 继续睡眠
+		//fmt.Printf("follower:%d get heart\n", rf.me)
 		reply.Term = rf.CurrentTerm
 		reply.Success = true
 	}
@@ -357,11 +373,17 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, flag *sync.Once, ar
 		fmt.Printf("sendRequestVote -> Call Raft.RequestVote error, server:%d to %d\n", rf.me, server)
 		return false
 	}
+	//// 收到新leader心跳包,且其任期大于等于自己,则会转变回follower,终止自己的candidate状态；
+	//if rf.State != Candidate {
+	//	return false
+	//}
 	fmt.Printf("server:%d, term:%d, commitIndex:%d\n", rf.me, rf.CurrentTerm, rf.CommitIndex)
 	// 发出投票请求后，当前候选人的任期如果比follower任期大，则会更新follower任期
 	if reply.VoteGranted {
 		fmt.Printf("server:%d 获取到server:%d的选票\n", rf.me, server)
 		*votesCount++
+	} else {
+		return false
 	}
 
 	// 胜选
@@ -375,13 +397,16 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, flag *sync.Once, ar
 		rf.MatchIndex = make([]int, len(rf.peers))
 
 		rf.State = Leader
+
 		flag.Do(func() {
 			fmt.Printf("%d win, term:%d\n", rf.me, rf.CurrentTerm)
 			//发送心跳包
 			go func() {
 				for {
-					time.Sleep(200 * time.Millisecond)
+					// 这里必须胜选后立刻发送心跳;
 					rf.sendHeartOrAppend()
+					time.Sleep(100 * time.Millisecond)
+
 					//fmt.Printf("%d server, term:%d\n", rf.me, rf.CurrentTerm)
 				}
 			}()
@@ -391,10 +416,8 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, flag *sync.Once, ar
 	return false
 }
 
-// leader
+// leader 这里是leader定时发送心跳，只有leader一个go程执行
 func (rf *Raft) sendHeartOrAppend() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	var flag sync.Once
 	var logSuccessCount LogSuccessCount
 	for i := range len(rf.peers) {
@@ -442,10 +465,11 @@ func (rf *Raft) sendHeartOrAppend() bool {
 			args.Entries = []LogEntries{entries}
 			fmt.Printf("Leader:%d send log to follower:%d, logIndex:%d\n", rf.me, i, rf.NextIndex[i]) // 新的nextIndex从1开始
 			//go rf.sendAppendEntries(i, &logSuccessCount, &flag, &args, &reply)
+
 			go rf.sendAppendEntries(i, &logSuccessCount, &flag, &args, &reply)
 			continue
 		}
-
+		fmt.Printf("leader:%d send appendRPC to %d\n", rf.me, i)
 		go rf.sendAppendEntries(i, nil, nil, &args, &reply)
 	}
 	return true
@@ -453,15 +477,14 @@ func (rf *Raft) sendHeartOrAppend() bool {
 
 // leader
 func (rf *Raft) sendAppendEntries(server int, successCount *LogSuccessCount, flag *sync.Once, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
 		fmt.Printf("sendAppendEntries -> Call Raft.AppendEntries error, server %d to %d\n", rf.me, server)
 		return true
 	}
 
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
 	// TODO follower收到日志后返回true，收到可提交后依然返回false？
 	if reply.Success && args.Entries != nil {
 		rf.NextIndex[server]++
@@ -473,6 +496,10 @@ func (rf *Raft) sendAppendEntries(server int, successCount *LogSuccessCount, fla
 
 	//fmt.Println("successCount.SuccessCount[successCount.LogIndex]: ", successCount.SuccessCount)
 	if args.Entries != nil && successCount.SuccessCount[successCount.LogIndex] > len(rf.peers)/2 {
+		if successCount.SuccessCount[successCount.LogIndex] == len(rf.peers) {
+			delete(successCount.SuccessCount, successCount.LogIndex)
+			fmt.Printf("All log:%d has been sync", successCount.LogIndex)
+		}
 		flag.Do(func() {
 			rf.CommitIndex++
 			fmt.Println("leader commitIndex:", rf.CommitIndex)
@@ -488,8 +515,12 @@ func (rf *Raft) sendAppendEntries(server int, successCount *LogSuccessCount, fla
 		})
 	}
 
+	//if args.Entries == nil && reply.Success == true {
+	//	fmt.Printf("leader:%d 收到:%d 的心跳包响应\n", rf.me, server)
+	//}
+
 	// TODO 返回false的处理
-	if !reply.Success {
+	if !reply.Success && args.Entries != nil {
 		if reply.Term > rf.CurrentTerm {
 			rf.CurrentTerm = reply.Term
 			if rf.State == Leader {
@@ -592,7 +623,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// 生成随机数范围从 500ms 到 800ms 的函数
+// 生成随机数范围从 300ms 到 800ms 的函数
 func randomDuration() time.Duration {
 	// 使用当前时间作为种子
 	source := rand.NewSource(time.Now().UnixNano())
@@ -600,7 +631,7 @@ func randomDuration() time.Duration {
 	generator := rand.New(source)
 
 	// 生成一个介于 0 到 400 之间的随机数，加上 700，得到随机范围内的毫秒数
-	randomMilliseconds := generator.Intn(301) + 500
+	randomMilliseconds := generator.Intn(501) + 300
 	// 将毫秒数转换为 Duration 类型
 	duration := time.Duration(randomMilliseconds) * time.Millisecond
 	return duration
@@ -610,7 +641,6 @@ func randomDuration() time.Duration {
 // 如果这位同行最近没有收到心跳，那么自动投票程序将开始新的选举。
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
@@ -619,6 +649,8 @@ func (rf *Raft) ticker() {
 		randomTime := randomDuration()
 		time.Sleep(randomTime)
 
+		fmt.Println("----")
+		//rf.mu.Lock()
 		fmt.Printf("%d server, term:%d, i am :%v\n", rf.me, rf.CurrentTerm, rf.State)
 		// 继续睡
 		// 可能是其他节点的投票请求重置，或者是心跳包重置（voteFor置-1），
@@ -629,9 +661,13 @@ func (rf *Raft) ticker() {
 				<-rf.ResetChan
 				reset = len(rf.ResetChan)
 			}
+			//rf.mu.Unlock()
 			continue
 		}
-		rf.mu.Lock()
+		//else {
+		//	rf.mu.Unlock()
+		//}
+		//rf.mu.Lock()
 		fmt.Printf("%d server, term:%d, start vote\n", rf.me, rf.CurrentTerm)
 		// 任期号自增
 		rf.CurrentTerm++
@@ -644,22 +680,22 @@ func (rf *Raft) ticker() {
 		reply := RequestVoteReply{}
 		rf.VotedFor = rf.me // 投给自己
 		rf.State = Candidate
+		//rf.mu.Unlock()
 
 		VotesCount := 1
 		var flag sync.Once
-		rf.mu.Unlock()
 		for i := range len(rf.peers) {
 			if i == rf.me {
 				continue
 			}
-			// 收到新leader心跳包,且其任期大于等于自己,则会转变回follower,终止自己的candidate状态；
-			if rf.State != Candidate {
-				return
-			}
+
 			//go func(num int) {
 			//	rf.sendRequestVote(num, &args, &reply)
 			//}(i)
+
+			fmt.Printf("server:%d send voteRPC to %d\n", rf.me, i)
 			go rf.sendRequestVote(i, &VotesCount, &flag, &args, &reply)
+
 		}
 	}
 }
@@ -688,11 +724,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.Log = append(rf.Log, LogEntries{})
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.CurrentTerm = 1 //不是应该初始化为0吗
+	rf.CurrentTerm = 0
 	rf.VotedFor = -1
 	rf.CommitIndex = 0
 	rf.LastApplied = 0
 	rf.NextIndex = make([]int, len(rf.peers))
+	// 这里需要初始化为1
+	for i := range rf.NextIndex {
+		rf.NextIndex[i] = rf.CommitIndex + 1
+	}
+
 	rf.MatchIndex = make([]int, len(rf.peers))
 	rf.ApplyMsg = applyCh //!!!!!
 
