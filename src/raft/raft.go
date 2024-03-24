@@ -245,9 +245,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 如果follower没有收到响应（投给某一个candidate后得到的响应），
 	// 那么此时voted在接收到下一个appendRPC前都是已经投票的状态；
 	// 所以避免这种问题，如果下一个投票请求任期高于当前任期，则直接向他投票；
+	// 貌似不用判断之前的投票，只要前面符合要求后，最后任期高于当前的就直接投票并更新自己的状态
 	if args.Term > rf.CurrentTerm {
 		rf.VotedFor = args.CandidateID
 		rf.CurrentTerm = args.Term // 更新follower的任期为候选人的任期
+
 		if rf.State == Candidate {
 			rf.State = Follower
 		} else if rf.State == Leader {
@@ -347,6 +349,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		fmt.Println("------------------")
 		fmt.Printf("follower:%d 收到 %d 的心跳\n", rf.me, args.LeaderID)
+		fmt.Println("------------------")
 
 		reply.Term = rf.CurrentTerm
 		reply.Success = true
@@ -371,7 +374,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.CommitIndex { // follower提交日志
 		rf.CommitIndex = min(args.LeaderCommit, len(rf.Log)-1) // 0不是日志，从1开始
 		rf.LastApplied = rf.CommitIndex                        // 暂时直接提交及应用
-		fmt.Printf("follower:%d 更新最新的提交日志索引: %d\n", rf.me, rf.CommitIndex)
+		fmt.Printf("follower:%d 更新最新的提交日志索引: min(%d, %d)\n", rf.me, args.LeaderCommit, len(rf.Log)-1)
 		applyMsg := ApplyMsg{
 			CommandValid: true,
 			Command:      rf.Log[rf.CommitIndex].Command,
@@ -448,24 +451,29 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int32, flag *sync.Once, 
 		//rf.VotedFor = -1
 
 		//rf.CurrentTerm == args.Term // 好像不需要
-		rf.NextIndex = make([]int, len(rf.peers))
-		for i := range rf.NextIndex {
-			// leader不可能覆盖自己的日志，所有应该初始化为最新日志的索引+1
-			//rf.NextIndex[i] = rf.CommitIndex + 1
-			rf.NextIndex[i] = len(rf.Log)
-		}
-		rf.MatchIndex = make([]int, len(rf.peers))
-
-		//if rf.State == Candidate
-		rf.State = Leader
-
 		flag.Do(func() {
+			rf.NextIndex = make([]int, len(rf.peers))
+			for i := range rf.NextIndex {
+				// leader不可能覆盖自己的日志，所有应该初始化为最新日志的索引+1
+				//rf.NextIndex[i] = rf.CommitIndex + 1
+				rf.NextIndex[i] = len(rf.Log)
+			}
+			rf.MatchIndex = make([]int, len(rf.peers))
+
+			rf.SuccessCount = make(map[int]int, 256)
+			// 新leader上任后，并不知道未提交的日志达成了多少的大多数，先投上自己一票
+			for i := rf.CommitIndex + 1; i < len(rf.Log); i++ {
+				rf.SuccessCount[i]++
+			}
+
+			//if rf.State == Candidate
+			rf.State = Leader
 			fmt.Printf("server:%d <- 胜选 ->，任期为: %d\n", rf.me, rf.CurrentTerm)
 			//发送心跳包
 			go func() {
 				rf.sendHeartOrAppend()
 				for {
-					// 这里必须胜选后立刻发送心跳;
+					// 这里胜选后立刻发送心跳;
 					select {
 					case <-time.After(100 * time.Millisecond):
 						rf.sendHeartOrAppend()
@@ -486,8 +494,9 @@ func (rf *Raft) sendHeartOrAppend() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	var flag sync.Once
-	var logSuccessCount LogSuccessCount
+	// 貌似下次心跳就会刷新掉flag
+	//var flag sync.Once
+	//var logSuccessCount LogSuccessCount
 
 	for i := range len(rf.peers) {
 		if i == rf.me {
@@ -509,10 +518,10 @@ func (rf *Raft) sendHeartOrAppend() bool {
 
 			//temp := 1
 			// 当前leader已经接收到日志，该日志的index 等于 follower期望同步的index
-			logSuccessCount = LogSuccessCount{
-				LogIndex:     rf.NextIndex[i],
-				SuccessCount: rf.SuccessCount,
-			}
+			//logSuccessCount = LogSuccessCount{
+			//	LogIndex:     rf.NextIndex[i],
+			//	SuccessCount: rf.SuccessCount,
+			//}
 			//logSuccessCount.SuccessCount = make(map[int]int, 5)
 
 			fmt.Printf("Leader:%d 发现server:%d, 日志落后，现在可能需要日志:%d\n", rf.me, i, rf.NextIndex[i])
@@ -524,17 +533,17 @@ func (rf *Raft) sendHeartOrAppend() bool {
 			args.Entries = []LogEntries{entries}
 			fmt.Printf("Leader:%d 任期为:%d 发送日志到follower:%d, logIndex:%d\n", rf.me, rf.CurrentTerm, i, rf.NextIndex[i]) // 新的nextIndex从1开始
 
-			go rf.sendAppendEntries(i, &logSuccessCount, &flag, &args, &reply)
+			go rf.sendAppendEntries(i, &args, &reply)
 			continue
 		}
 		fmt.Printf("leader:%d 发送心跳包到follower:%d\n", rf.me, i)
-		go rf.sendAppendEntries(i, nil, nil, &args, &reply)
+		go rf.sendAppendEntries(i, &args, &reply)
 	}
 	return true
 }
 
 // leader
-func (rf *Raft) sendAppendEntries(server int, successCount *LogSuccessCount, flag *sync.Once, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
 		fmt.Printf("leader %d to %d, sendAppendEntries -> Call Raft.AppendEntries error\n", rf.me, server)
@@ -545,37 +554,38 @@ func (rf *Raft) sendAppendEntries(server int, successCount *LogSuccessCount, fla
 	defer rf.mu.Unlock()
 
 	// TODO
+	// 正常情况：
 	if reply.Success && args.Entries != nil {
 		//rf.NextIndex[server]++
 		if rf.NextIndex[server] != args.Entries[0].LogID+1 {
-			//successCount.SuccessCount[args.PrevLogIndex+1]++
-			successCount.SuccessCount[args.PrevLogIndex+1]++
+			//successCount.SuccessCount[args.Entries[0].LogID]++
+			rf.SuccessCount[args.Entries[0].LogID]++
 		}
 		rf.NextIndex[server] = args.Entries[0].LogID + 1
 		rf.MatchIndex[server] = args.Entries[0].LogID
 
 		//TODO successCount.LogIndex 不等于args.PrevLogIndex+1
-		//leader:1 收到follower:0 的响应:3 ok
-		//日志:2 目前达成3个节点的同意
 
-		//fmt.Printf("日志:%d 目前达成%d个节点的同意\n", successCount.LogIndex, successCount.SuccessCount[successCount.LogIndex])
-		fmt.Printf("leader:%d 收到follower:%d 的响应:%d ok\n", rf.me, server, args.PrevLogIndex+1)
-		fmt.Printf("日志:%d 目前达成%d个节点的同意\n", args.PrevLogIndex+1, successCount.SuccessCount[args.PrevLogIndex+1])
+		//fmt.Printf("leader:%d 收到follower:%d 的响应:%d ok\n", rf.me, server, args.Entries[0].LogID)
+		//fmt.Printf("日志:%d 目前达成%d个节点的同意\n", args.PrevLogIndex+1, successCount.SuccessCount[args.Entries[0].LogID])
+		fmt.Printf("leader:%d 收到follower:%d 的响应:%d ok\n", rf.me, server, args.Entries[0].LogID)
+		fmt.Printf("日志:%d 目前达成%d个节点的同意\n", args.PrevLogIndex+1, rf.SuccessCount[args.Entries[0].LogID])
 	}
 
 	// TODO
+	// 日志达成大多数
 	//fmt.Println("successCount.SuccessCount[successCount.LogIndex]: ", successCount.SuccessCount)
-	if args.Entries != nil && successCount.SuccessCount[args.PrevLogIndex+1] > len(rf.peers)/2 {
-		if successCount.SuccessCount[args.PrevLogIndex+1] == len(rf.peers) {
-			delete(successCount.SuccessCount, args.PrevLogIndex+1)
-			fmt.Printf("该日志:%d已被同步到所有follower\n", args.PrevLogIndex+1)
+	if args.Entries != nil && rf.SuccessCount[args.Entries[0].LogID] > len(rf.peers)/2 {
+		if rf.SuccessCount[args.Entries[0].LogID] == len(rf.peers) {
+			delete(rf.SuccessCount, args.Entries[0].LogID)
+			fmt.Printf("该日志:%d已被同步到所有follower\n", args.Entries[0].LogID)
 		}
 		//flag.Do(func() {
 		rf.CommitIndex = max(args.Entries[0].LogID, rf.CommitIndex)
 		fmt.Printf("leader:%d 更新被提交的最高日志条目的索引为:%d\n", rf.me, rf.CommitIndex)
 
-		rf.LastApplied = rf.CommitIndex // 暂时直接提交及应用
-		fmt.Println("leader:", rf.Log)
+		rf.LastApplied = rf.CommitIndex // 暂时直接提交=应用
+		fmt.Printf("leader:%d 日志:%v", rf.me, rf.Log)
 		applyMsg := ApplyMsg{
 			CommandValid: true,
 			Command:      rf.Log[rf.CommitIndex].Command,
@@ -593,6 +603,10 @@ func (rf *Raft) sendAppendEntries(server int, successCount *LogSuccessCount, fla
 	// 此时返回的false可能是因为leader任期小于follower，或者follower日志不够新需要回退
 	if !reply.Success && args.Entries != nil && reply.Term == rf.CurrentTerm {
 		rf.NextIndex[server]-- // 回退日志
+		// leader已经提交了，但是follower缺少日志在追的过程中，leader必须也先要投一票
+		if rf.SuccessCount[rf.NextIndex[server]] == 0 {
+			rf.SuccessCount[rf.NextIndex[server]]++
+		}
 	} else if reply.Term > rf.CurrentTerm {
 		rf.CurrentTerm = reply.Term
 		if rf.State == Leader {
@@ -623,11 +637,13 @@ func (rf *Raft) sendAppendEntries(server int, successCount *LogSuccessCount, fla
 // 如果此服务器认为它是领导者，则第三个返回值为true。
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term, isLeader := rf.GetState()
-	index := rf.CommitIndex + 1 //注意此处要+1，因为是leader确定下一个需要被提交的日志的index
+	//index := rf.CommitIndex + 1 //注意此处要+1，因为是leader确定下一个需要被提交的日志的index
+	index := len(rf.Log)
 	// 这里没写重定向到leader
 	if !isLeader {
 		fmt.Printf("follower:%d return CommitIndex:%d\n", rf.me, rf.CommitIndex)
-		return index + 1, term, isLeader //-1
+		//return index, term, isLeader
+		return -1, term, isLeader //-1
 	}
 
 	rf.mu.Lock()
@@ -642,35 +658,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.Log = append(rf.Log, entries)
 	rf.SuccessCount[len(rf.Log)-1]++ //记得leader同步的日志也算进大多数内
 	fmt.Printf("leader:%d 日志:%v\n", rf.me, rf.Log)
-	// leader
-	//var flag sync.Once
-	//for server, _ := range rf.NextIndex {
-	//	if server == rf.me {
-	//		continue
-	//	}
-	//	entries.LogID = rf.NextIndex[server] //是索引，或者直接用值代替
-	//
-	//	fmt.Printf("Leader:%d send log to follower:%d, logIndex:%d\n", rf.me, server, rf.NextIndex[server]) // 新的nextIndex从1开始
-	//
-	//	// TODO 如果请求和心跳包两个是不同的发送appendRPC，那么请求有可能返回多次false，导致nextIndex不正常回退
-	//	args := AppendEntriesArgs{
-	//		Term:         rf.CurrentTerm,
-	//		LeaderID:     rf.me,
-	//		PrevLogIndex: rf.NextIndex[server] - 1,              // 错误
-	//		PrevLogTerm:  rf.Log[rf.NextIndex[server]-1].TermID, // 错误
-	//		//PrevLogIndex: len(rf.Log) - 2,
-	//		//PrevLogTerm:  rf.Log[len(rf.Log)-2].TermID,
-	//		Entries:      []LogEntries{entries},
-	//		LeaderCommit: rf.CommitIndex,
-	//	}
-	//
-	//	reply := AppendEntriesReply{}
-	//	successCount := 1
-	//	go rf.sendAppendEntries(server, &successCount, &flag, &args, &reply)
-	//}
+	// 如果请求和心跳包两个是不同的发送appendRPC，那么请求有可能返回多次false，导致nextIndex不正常回退
 
 	// Your code here (2B).
 	//fmt.Printf("leader:%d return CommitIndex:%d\n", rf.me, rf.CommitIndex)
+	fmt.Printf("leader将返回该日志期望的提交位置:%d，当前任期:%d，和自己是leader:%v\n", index, term, isLeader)
 	return index, term, isLeader
 }
 
@@ -726,8 +718,6 @@ func (rf *Raft) ticker() {
 		randomTime := randomDuration()
 		time.Sleep(randomTime)
 
-		fmt.Println("----")
-
 		//fmt.Printf("%d server, term:%d, i am :%v\n", rf.me, rf.CurrentTerm, rf.State)
 		// 继续睡
 		// 可能是其他节点的投票请求重置，或者是心跳包重置（voteFor置-1），
@@ -738,6 +728,7 @@ func (rf *Raft) ticker() {
 				<-rf.ResetChan
 				reset = len(rf.ResetChan)
 			}
+			fmt.Println("----------")
 			continue
 		}
 
@@ -818,7 +809,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.ResetChan = make(chan int, 10)
 	// // 将写入leader的日志内容，通过channel发送到负责心跳包的goroutine并且发送出去
 	rf.AppendEntriesChan = make(chan []LogEntries, 10)
-	rf.SuccessCount = make(map[int]int, 64)
+	rf.SuccessCount = make(map[int]int, 256)
 
 	rf.Ctx, rf.Cancel = context.WithCancel(context.Background())
 
