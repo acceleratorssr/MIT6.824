@@ -434,7 +434,7 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int32, flag *sync.Once, 
 			for i := rf.CommitIndex + 1; i < len(rf.Log); i++ {
 				rf.SuccessCount[i]++
 			}
-			rf.dead = 0
+
 			if rf.State == Candidate {
 				rf.State = Leader
 			}
