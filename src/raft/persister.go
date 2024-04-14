@@ -1,7 +1,9 @@
 package raft
 
 //
+// 支持Raft和kvraft以保存持久
 // support for Raft and kvraft to save persistent
+// Raft状态（日志和控制）和k/v服务器快照。
 // Raft state (log &c) and k/v server snapshots.
 //
 // we will use the original persister.go to test your code for grading.

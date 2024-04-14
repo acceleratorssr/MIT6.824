@@ -353,7 +353,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				Command:      rf.Log[i].Command,
 				CommandIndex: i,
 			}
-			rf.ApplyMsg <- applyMsg
+			rf.ApplyMsg <- applyMsg // 小心阻塞
 			_, _ = DPrintf("follower:%d 日志: %v\n", rf.me, rf.Log)
 		}
 		rf.CommitIndex = args.LeaderCommit
@@ -398,7 +398,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // and that the caller passes the address of the reply struct with &, not the struct itself.
 // 如果您在使RPC工作时遇到问题，请检查您是否已将通过RPC传递的结构中的所有字段名大写，并且调用者是否使用&传递回复结构的地址，而不是结构本身。
 // flag 为true时，胜选变为leader
-func (rf *Raft) sendRequestVote(server int, votesCount *int32, flag *sync.Once, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, votesCount *int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
 		_, _ = DPrintf("server:%d to %d, sendRequestVote -> Call Raft.RequestVote error\n", rf.me, server)
@@ -411,47 +411,48 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int32, flag *sync.Once, 
 	// 发出投票请求后，当前候选人的任期如果比follower任期大，则会更新follower任期
 	if reply.VoteGranted {
 		_, _ = DPrintf("server:%d 获取到server:%d的选票\n", rf.me, server)
-		atomic.AddInt32(votesCount, 1)
+		*votesCount++
 	} else {
-		return false
+		if reply.Term > rf.CurrentTerm {
+			rf.CurrentTerm = reply.Term
+			rf.VotedFor = -1
+			rf.State = Follower
+			// persist
+		}
 	}
 
 	// 胜选
-	if *votesCount > int32(len(rf.peers))/2 && rf.State == Candidate && rf.CurrentTerm == args.Term {
-		flag.Do(func() {
-			rf.NextIndex = make([]int, len(rf.peers))
-			for i := range rf.NextIndex {
-				// leader不可能覆盖自己的日志，所有应该初始化为最新日志的索引+1
-				rf.NextIndex[i] = len(rf.Log)
-			}
-			rf.MatchIndex = make([]int, len(rf.peers))
+	if *votesCount > len(rf.peers)/2 && rf.CurrentTerm == args.Term && rf.State == Candidate { //后两条件貌似不可少
+		rf.NextIndex = make([]int, len(rf.peers))
+		for i := range rf.NextIndex {
+			// leader不可能覆盖自己的日志，所有应该初始化为最新日志的索引+1
+			rf.NextIndex[i] = len(rf.Log)
+		}
+		//rf.MatchIndex = make([]int, len(rf.peers))
 
-			rf.SuccessCount = make(map[int]int, 256)
-			// 新leader上任后，并不知道未提交的日志达成了多少的大多数，先投上自己一票
-			for i := rf.CommitIndex + 1; i < len(rf.Log); i++ {
-				rf.SuccessCount[i]++
-			}
+		rf.SuccessCount = make(map[int]int, 256)
+		// 新leader上任后，并不知道未提交的日志达成了多少的大多数，先投上自己一票
+		for i := rf.CommitIndex + 1; i < len(rf.Log); i++ {
+			rf.SuccessCount[i]++
+		}
 
-			if rf.State == Candidate {
-				rf.State = Leader
-			}
+		rf.State = Leader
 
-			_, _ = DPrintf("server:%d <- 胜选 ->，任期为: %d\n", rf.me, rf.CurrentTerm)
-			//发送心跳包
-			go func() {
-				rf.sendHeartOrAppend()
-				for {
-					// 这里胜选后立刻发送心跳;
-					select {
-					case <-time.After(100 * time.Millisecond):
-						rf.sendHeartOrAppend()
-					case <-rf.Ctx.Done():
-						_, _ = DPrintf("leader:%d 停止发送心跳包\n", rf.me)
-						return
-					}
+		_, _ = DPrintf("server:%d <- 胜选 ->，任期为: %d\n", rf.me, rf.CurrentTerm)
+		//发送心跳包
+		go func() {
+			rf.sendHeartOrAppend()
+			for {
+				// 这里胜选后立刻发送心跳;
+				select {
+				case <-time.After(100 * time.Millisecond):
+					rf.sendHeartOrAppend()
+				case <-rf.Ctx.Done():
+					_, _ = DPrintf("leader:%d 停止发送心跳包\n", rf.me)
+					return
 				}
-			}()
-		})
+			}
+		}()
 	}
 
 	return false
@@ -471,6 +472,7 @@ func (rf *Raft) sendHeartOrAppend() bool {
 			//检查自己如果不是leader就停止发送
 			return true
 		}
+
 		args := AppendEntriesArgs{
 			Term:         rf.CurrentTerm,
 			LeaderID:     rf.me,
@@ -483,14 +485,25 @@ func (rf *Raft) sendHeartOrAppend() bool {
 		if args.PrevLogIndex < len(rf.Log)-1 {
 			var entries LogEntries
 
-			_, _ = DPrintf("Leader:%d 发现server:%d, 日志落后，现在可能需要日志:%d\n", rf.me, i, rf.NextIndex[i])
-			entries = LogEntries{
-				LogID:   rf.NextIndex[i],
-				TermID:  rf.Log[rf.NextIndex[i]].TermID,
-				Command: rf.Log[rf.NextIndex[i]].Command,
+			// 一次最多同时发10个
+			for j := rf.NextIndex[i]; j < min(len(rf.Log), rf.NextIndex[i]+10); j++ {
+				_, _ = DPrintf("Leader:%d 发现server:%d, 日志落后，现在可能需要日志:%d\n", rf.me, i, rf.NextIndex[i])
+				entries = LogEntries{
+					LogID:   j,
+					TermID:  rf.Log[j].TermID,
+					Command: rf.Log[j].Command,
+				}
+
+				args.Entries = append(args.Entries, entries)
 			}
-			args.Entries = []LogEntries{entries}
-			_, _ = DPrintf("Leader:%d 任期为:%d 发送日志到follower:%d, logIndex:%d\n", rf.me, rf.CurrentTerm, i, rf.NextIndex[i])
+			//_, _ = DPrintf("Leader:%d 发现server:%d, 日志落后，现在可能需要日志:%d\n", rf.me, i, rf.NextIndex[i])
+			//entries = LogEntries{
+			//	LogID:   rf.NextIndex[i],
+			//	TermID:  rf.Log[rf.NextIndex[i]].TermID,
+			//	Command: rf.Log[rf.NextIndex[i]].Command,
+			//}
+			//args.Entries = []LogEntries{entries}
+			//_, _ = DPrintf("Leader:%d 任期为:%d 发送日志到follower:%d, logIndex:%d\n", rf.me, rf.CurrentTerm, i, rf.NextIndex[i])
 
 			go rf.sendAppendEntries(i, &args, &reply)
 			continue
@@ -513,37 +526,58 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 正常情况：
+	// <-- 判断发送给follower的单个或者多个日志条目的append RPC是否返回ack -->
 	if reply.Success && args.Entries != nil {
-		if rf.NextIndex[server] != args.Entries[0].LogID+1 {
-			rf.SuccessCount[args.Entries[0].LogID]++
+		// 如果收到ack，则代表args内的日志全被接收了，这部分的日志的计数需要增加
+		if rf.NextIndex[server] != args.Entries[len(args.Entries)-1].LogID+1 {
+			for i := 0; i < len(args.Entries); i++ {
+				rf.SuccessCount[args.Entries[i].LogID]++
+				_, _ = DPrintf("leader:%d 收到follower:%d 的响应:%d ok\n", rf.me, server, args.Entries[i].LogID)
+				_, _ = DPrintf("日志:%d 目前达成%d个节点的同意\n", args.PrevLogIndex+1+i, rf.SuccessCount[args.Entries[i].LogID])
+			}
 		}
-		rf.NextIndex[server] = args.Entries[0].LogID + 1
-		rf.MatchIndex[server] = args.Entries[0].LogID
 
-		_, _ = DPrintf("leader:%d 收到follower:%d 的响应:%d ok\n", rf.me, server, args.Entries[0].LogID)
-		_, _ = DPrintf("日志:%d 目前达成%d个节点的同意\n", args.PrevLogIndex+1, rf.SuccessCount[args.Entries[0].LogID])
+		rf.NextIndex[server] = args.Entries[len(args.Entries)-1].LogID + 1
+		rf.MatchIndex[server] = args.Entries[len(args.Entries)-1].LogID
+
+		//_, _ = DPrintf("leader:%d 收到follower:%d 的响应:%d ok\n", rf.me, server, args.Entries[0].LogID)
+		//_, _ = DPrintf("日志:%d 目前达成%d个节点的同意\n", args.PrevLogIndex+1, rf.SuccessCount[args.Entries[0].LogID])
 	}
 
-	// 日志达成大多数
-	if args.Entries != nil && rf.SuccessCount[args.Entries[0].LogID] > len(rf.peers)/2 {
-		if rf.SuccessCount[args.Entries[0].LogID] == len(rf.peers) {
-			delete(rf.SuccessCount, args.Entries[0].LogID)
-			_, _ = DPrintf("该日志:%d已被同步到所有follower\n", args.Entries[0].LogID)
-		}
-		//flag.Do(func() {
-		rf.CommitIndex = max(args.Entries[0].LogID, rf.CommitIndex)
-		_, _ = DPrintf("leader:%d 更新被提交的最高日志条目的索引为:%d\n", rf.me, rf.CommitIndex)
+	// <-- 判断单个或者多个日志条目是否达成大多数 -->
+	for i := 0; i < len(args.Entries); i++ {
+		if args.Entries != nil && rf.SuccessCount[args.Entries[i].LogID] > len(rf.peers)/2 {
+			if rf.SuccessCount[args.Entries[i].LogID] == len(rf.peers) {
+				delete(rf.SuccessCount, args.Entries[i].LogID)
+				_, _ = DPrintf("该日志:%d已被同步到所有follower\n", args.Entries[0].LogID)
+			}
+			//flag.Do(func() {
+			if rf.CommitIndex < args.Entries[i].LogID {
+				rf.CommitIndex = args.Entries[i].LogID
+				_, _ = DPrintf("leader:%d 更新被提交的最高日志条目的索引为:%d\n", rf.me, rf.CommitIndex)
 
-		rf.LastApplied = rf.CommitIndex // 暂时直接提交=应用
-		_, _ = DPrintf("leader:%d 日志:%v", rf.me, rf.Log)
-		applyMsg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.Log[rf.CommitIndex].Command,
-			CommandIndex: rf.CommitIndex,
+				rf.LastApplied = rf.CommitIndex // 暂时直接提交=应用
+				_, _ = DPrintf("leader:%d 日志:%v", rf.me, rf.Log)
+				applyMsg := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.Log[rf.CommitIndex].Command,
+					CommandIndex: rf.CommitIndex,
+				}
+				rf.ApplyMsg <- applyMsg
+			}
+			rf.CommitIndex = max(args.Entries[i].LogID, rf.CommitIndex)
+			_, _ = DPrintf("leader:%d 更新被提交的最高日志条目的索引为:%d\n", rf.me, rf.CommitIndex)
+
+			rf.LastApplied = rf.CommitIndex // 暂时直接提交=应用
+			_, _ = DPrintf("leader:%d 日志:%v", rf.me, rf.Log)
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.Log[rf.CommitIndex].Command,
+				CommandIndex: rf.CommitIndex,
+			}
+			rf.ApplyMsg <- applyMsg
+			//})
 		}
-		rf.ApplyMsg <- applyMsg
-		//})
 	}
 
 	// 返回false的处理
@@ -587,6 +621,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // 如果此服务器认为它是领导者，则第三个返回值为true。
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term, isLeader := rf.GetState()
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := len(rf.Log) //注意此处是leader确定下一个需要被提交的日志的index
 	// 这里没写重定向到leader
 	if !isLeader {
@@ -594,9 +631,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		//return index, term, isLeader
 		return -1, term, isLeader //-1
 	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	entries := LogEntries{
 		LogID:   len(rf.Log),
@@ -686,18 +720,18 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 			continue
 		}
-		_, _ = DPrintf("%d server, term:%d, start vote\n", rf.me, rf.CurrentTerm)
+
+		_, _ = DPrintf("server:%d, term:%d, start vote\n", rf.me, rf.CurrentTerm)
+
 		// 任期号自增
 		rf.CurrentTerm++
-
 		rf.VotedFor = rf.me // 投给自己
 		rf.State = Candidate
+		// persist
 
 		rf.mu.Unlock()
 
-		var VotesCount int32
-		VotesCount = 1
-		var flag sync.Once
+		VotesCount := 1
 		for i := range len(rf.peers) {
 			if i == rf.me {
 				continue
@@ -711,8 +745,8 @@ func (rf *Raft) ticker() {
 			}
 			reply := RequestVoteReply{}
 
-			_, _ = DPrintf("server:%d send voteRPC to %d\n", rf.me, i)
-			go rf.sendRequestVote(i, &VotesCount, &flag, &args, &reply)
+			//_, _ = DPrintf("server:%d send voteRPC to %d\n", rf.me, i)
+			go rf.sendRequestVote(i, &VotesCount, &args, &reply)
 		}
 	}
 }
