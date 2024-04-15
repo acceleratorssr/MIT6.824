@@ -19,6 +19,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"context"
 	"math/rand"
 	//	"bytes"
@@ -119,12 +121,14 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VotedFor)
+	e.Encode(rf.Log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	_, _ = DPrintf("持久化状态成功\n")
 }
 
 // 恢复以前的持久状态。
@@ -134,17 +138,23 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var voteFor int
+	var log []LogEntries
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&log) != nil {
+		_, _ = DPrintf("readPersist -> Decode error\n")
+	} else {
+		rf.CurrentTerm = currentTerm
+		rf.VotedFor = voteFor
+		rf.Log = log
+		//rf.CommitIndex=
+		_, _ = DPrintf("恢复状态为: currentTerm: %d, voteFor: %d log: %v\n",
+			rf.CurrentTerm, rf.VotedFor, rf.Log)
+	}
 }
 
 // CondInstallSnapshot 服务希望切换到快照。只有当Raft在applyCh上传递快照后没有更新的信息时才这样做。
@@ -215,7 +225,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// <-- 检查候选人是否具备最新的日志 -->
 	// 即使投false，也要更新到候选人的任期
 	// 如果反对投票，follower任期大于leader,leader直接下岗,然后任一节点超时发起选举，有最新已提交日志的才有可能胜选
-	if args.LastLogIndex < rf.CommitIndex {
+	//if args.LastLogIndex < rf.CommitIndex { // 对比的应该是自己最新的日志，而不是自己最新提交的日志
+	if args.LastLogIndex < len(rf.Log)-1 {
 		rf.CurrentTerm = args.Term
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
@@ -224,13 +235,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.State = Follower
 		}
 		_, _ = DPrintf("server:%d 接收到节点:%d的投票请求，它的任期为:%d，最新日志索引为:%d，任期大于当前任期，但是日志不是最新的，故拒绝投票\n", rf.me, args.CandidateID, args.Term, args.LastLogIndex)
+		rf.persist() // 此处可能会更新节点当前任期
 		return
 	}
 
 	// <-- 处理任期不匹配的问题 -->
 	// 此时如果下一个投票请求任期高于当前任期，则直接向他投票；
 	if args.Term > rf.CurrentTerm {
-		rf.ResetChan <- 1 // 请求投票RPC也会刷新计时，之前忘了加
+		//rf.ResetChan <- 1 // 请求投票RPC也会刷新计时，之前忘了加
 		rf.VotedFor = args.CandidateID
 		rf.CurrentTerm = args.Term // 更新follower的任期为候选人的任期
 
@@ -245,6 +257,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		_, _ = DPrintf("server:%d 投票给了:%d\n", rf.me, args.CandidateID)
 
 		rf.ResetChan <- 1 // 通知ticker重新初始化
+		rf.persist()
 		return
 	}
 
@@ -271,6 +284,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.Cancel()
 			_, _ = DPrintf("旧leader:%d 转变为follower\n", rf.me)
 		}
+		rf.persist()
 	}
 
 	// <-- 处理follower日志落后n条的问题 -->
@@ -279,7 +293,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		_, _ = DPrintf("follower:%d 日志落后超过一个日志条目\n", rf.me)
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
-		reply.HopeLogIndex = rf.CommitIndex + 1
+		//reply.HopeLogIndex = rf.CommitIndex + 1
+		reply.HopeLogIndex = len(rf.Log)
 		_, _ = DPrintf("follower:%d 期望日志索引:%d\n", rf.me, reply.HopeLogIndex)
 		_, _ = DPrintf("follower:%d 日志:%v\n", rf.me, rf.Log)
 		return
@@ -295,7 +310,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
-		reply.HopeLogIndex = rf.CommitIndex + 1
+		//reply.HopeLogIndex = rf.CommitIndex + 1
+		reply.HopeLogIndex = len(rf.Log)
 
 		_, _ = DPrintf("follower:%d 期望日志索引:%d\n", rf.me, reply.HopeLogIndex)
 		_, _ = DPrintf("follower:%d 日志:%v\n", rf.me, rf.Log)
@@ -311,6 +327,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.Log = rf.Log[:args.PrevLogIndex+1]
 			_, _ = DPrintf("server:%d 一个现有的条目%d 与一个新的条目%d 相冲突\n", rf.me, len(rf.Log), args.PrevLogIndex+1)
 			_, _ = DPrintf("server:%d 日志:%v\n", rf.me, rf.Log)
+			rf.persist()
 		} else if len(rf.Log) > args.PrevLogIndex+1 && args.Entries[0].TermID == rf.Log[args.PrevLogIndex+1].TermID {
 			_, _ = DPrintf("server:%d 收到重复的相同日志: %d\n", rf.me, args.PrevLogIndex+1)
 			reply.Term = rf.CurrentTerm
@@ -332,6 +349,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		_, _ = DPrintf("follower:%d 收到 %d 的心跳\n", rf.me, args.LeaderID)
 		reply.Term = rf.CurrentTerm
 		reply.Success = true
+		rf.persist()
 	} else {
 		for _, v := range args.Entries {
 			rf.Log = append(rf.Log, v)
@@ -340,10 +358,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.ResetChan <- 1 // 继续睡眠
 		reply.Term = rf.CurrentTerm
 		reply.Success = true
+		rf.persist()
 	}
 
 	// <-- 检查是否需要提交日志 -->
 	// 提交 rf.commitIndex 到 leaderCommit 之间的日志
+	// 以免节点重启后丢失commitIndex没有被及时恢复?
 	if args.LeaderCommit > rf.CommitIndex {
 		args.LeaderCommit = min(args.LeaderCommit, len(rf.Log)-1) // 0不是日志，从1开始
 		for i := rf.CommitIndex + 1; i <= args.LeaderCommit; i++ {
@@ -417,12 +437,13 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, args *RequestVoteAr
 			rf.CurrentTerm = reply.Term
 			rf.VotedFor = -1
 			rf.State = Follower
-			// persist
+			rf.persist()
 		}
 	}
 
 	// 胜选
 	if *votesCount > len(rf.peers)/2 && rf.CurrentTerm == args.Term && rf.State == Candidate { //后两条件貌似不可少
+		rf.VotedFor = -1 // 胜选后向投票置为-1
 		rf.NextIndex = make([]int, len(rf.peers))
 		for i := range rf.NextIndex {
 			// leader不可能覆盖自己的日志，所有应该初始化为最新日志的索引+1
@@ -439,6 +460,7 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, args *RequestVoteAr
 		rf.State = Leader
 
 		_, _ = DPrintf("server:%d <- 胜选 ->，任期为: %d\n", rf.me, rf.CurrentTerm)
+		rf.persist()
 		//发送心跳包
 		go func() {
 			rf.sendHeartOrAppend()
@@ -598,6 +620,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			rf.Cancel()
 		}
 		_, _ = DPrintf("old leader:%d 发现自己任期小于follower:%d 故变回follower\n ", rf.me, server)
+		rf.persist()
 	}
 	return true
 }
@@ -647,6 +670,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 
 	_, _ = DPrintf("leader将返回该日志期望的提交位置:%d，当前任期:%d，和自己是leader:%v\n", index, term, isLeader)
+	rf.persist()
 	return index, term, isLeader
 }
 
@@ -716,6 +740,7 @@ func (rf *Raft) ticker() {
 		}
 
 		rf.mu.Lock()
+
 		if rf.State == Leader {
 			rf.mu.Unlock()
 			continue
@@ -727,8 +752,7 @@ func (rf *Raft) ticker() {
 		rf.CurrentTerm++
 		rf.VotedFor = rf.me // 投给自己
 		rf.State = Candidate
-		// persist
-
+		rf.persist()
 		rf.mu.Unlock()
 
 		VotesCount := 1
@@ -738,16 +762,18 @@ func (rf *Raft) ticker() {
 			}
 
 			args := RequestVoteArgs{
-				Term:         rf.CurrentTerm,
-				CandidateID:  rf.me,
-				LastLogIndex: rf.CommitIndex,
-				LastLogTerm:  rf.CurrentTerm,
+				Term:        rf.CurrentTerm,
+				CandidateID: rf.me,
+				//LastLogIndex: rf.CommitIndex,
+				LastLogIndex: len(rf.Log) - 1,
+				LastLogTerm:  rf.Log[len(rf.Log)-1].TermID,
 			}
 			reply := RequestVoteReply{}
 
 			//_, _ = DPrintf("server:%d send voteRPC to %d\n", rf.me, i)
 			go rf.sendRequestVote(i, &VotesCount, &args, &reply)
 		}
+
 	}
 }
 
@@ -798,6 +824,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	// 从崩溃前保持的状态初始化
 	rf.readPersist(persister.ReadRaftState())
+	_, _ = DPrintf("server:%d 成功恢复状态", rf.me)
 
 	// start ticker goroutine to start elections
 	// 启动ticker goroutine启动选举
