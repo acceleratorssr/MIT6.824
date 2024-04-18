@@ -2,14 +2,27 @@ package raft
 
 import (
 	"log"
+	"os"
 )
 
 // Debugging
 const Debug = true
 
+var (
+	debugLog *log.Logger
+)
+
+func init() {
+	file, err := os.Create("debug.log")
+	if err != nil {
+		log.Fatalf("Failed to open log file: %v", err)
+	}
+	debugLog = log.New(file, "DEBUG: ", log.Lshortfile)
+}
+
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
-		log.Printf(format, a...)
+		debugLog.Printf(format, a...)
 	}
 	return
 }

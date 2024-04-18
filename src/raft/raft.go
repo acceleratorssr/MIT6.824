@@ -102,7 +102,6 @@ type Raft struct {
 	ResetChan         chan int
 	AppendEntriesChan chan []LogEntries
 	ApplyMsg          chan ApplyMsg
-	SuccessCount      map[int]int //记录对应日志的同步情况，follower全返回true则删除对应kv
 	Ctx               context.Context
 	Cancel            context.CancelFunc
 }
@@ -229,10 +228,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.CurrentTerm = args.Term
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
-		if rf.State == Leader {
-			rf.Cancel()
-			rf.State = Follower
-		}
+		//if rf.State == Leader {
+		//	rf.Cancel()
+		//	rf.State = Follower
+		//}
 		_, _ = DPrintf("server:%d 接收到节点:%d的投票请求，它的任期为:%d，最新日志任期和索引为:%d,%d，任期大于当前任期，但是日志不是最新的，故拒绝投票\n", rf.me, args.CandidateID, args.Term, args.LastLogTerm, args.LastLogIndex)
 		rf.persist() // 此处可能会更新节点当前任期
 		return
@@ -242,10 +241,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.CurrentTerm = args.Term
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
-		if rf.State == Leader {
-			rf.Cancel()
-			rf.State = Follower
-		}
+		//if rf.State == Leader {
+		//	rf.Cancel()
+		//	rf.State = Follower
+		//}
 		_, _ = DPrintf("server:%d 接收到节点:%d的投票请求，它的任期为:%d，最新日志任期和索引为:%d,%d，任期大于当前任期，但是日志不是最新的，故拒绝投票\n", rf.me, args.CandidateID, args.Term, args.LastLogTerm, args.LastLogIndex)
 		rf.persist() // 此处可能会更新节点当前任期
 		return
@@ -316,7 +315,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// <-- 处理日志期望对应的任期不匹配的问题 -->
 	// 如果日志在prevLogIndex处不包含term与prevLogTerm匹配的条目，则返回false，表示需要回退；
 	if args.PrevLogTerm != rf.Log[args.PrevLogIndex].TermID {
-		_, _ = DPrintf("args.PrevLogIndex, PrevLogTerm:%d %d\n", args.PrevLogIndex, args.PrevLogTerm)
+		//_, _ = DPrintf("args.PrevLogIndex, PrevLogTerm:%d %d\n", args.PrevLogIndex, args.PrevLogTerm)
 		_, _ = DPrintf("follower:%d 日志在prevLogIndex:%d 处不包含term:%d 与prevLogTerm:%d 匹配的条目\n",
 			rf.me, args.PrevLogIndex, rf.Log[args.PrevLogIndex].TermID, args.PrevLogTerm)
 		_, _ = DPrintf("follower:%d 日志落后超过一个日志条目\n", rf.me)
@@ -376,16 +375,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// <--    检查是否需要提交日志 	-->
-	// <!! 注意，不能只提交旧任期的日志 	!!>
 	// 提交 rf.commitIndex 到 leaderCommit 之间的日志
-	// 以免节点重启后丢失commitIndex没有被及时恢复?
+	// 节点重启后丢失commitIndex没有被及时恢复?
 	if args.LeaderCommit > rf.CommitIndex {
 		args.LeaderCommit = min(args.LeaderCommit, len(rf.Log)-1) // 0不是日志，从1开始
+		_, _ = DPrintf("follower:%d 更新最新的提交日志索引: %d\n", rf.me, args.LeaderCommit)
 		for i := rf.CommitIndex + 1; i <= args.LeaderCommit; i++ {
-			//if rf.Log[i].TermID != rf.CurrentTerm {
-			//	continue // 不主动提交旧任期的日志
-			//}
-			_, _ = DPrintf("follower:%d 更新最新的提交日志索引: %d\n", rf.me, i)
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.Log[i].Command,
@@ -439,7 +434,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendRequestVote(server int, votesCount *int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
-		_, _ = DPrintf("server:%d to %d, sendRequestVote -> Call Raft.RequestVote error\n", rf.me, server)
+		//_, _ = DPrintf("server:%d to %d, sendRequestVote -> Call Raft.RequestVote error\n", rf.me, server)
 		return false
 	}
 
@@ -453,7 +448,7 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, args *RequestVoteAr
 	} else {
 		if reply.Term > rf.CurrentTerm {
 			rf.CurrentTerm = reply.Term
-			rf.VotedFor = -1
+			//rf.VotedFor = -1
 			rf.State = Follower
 			rf.persist()
 		}
@@ -467,13 +462,7 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, args *RequestVoteAr
 			// leader不可能覆盖自己的日志，所有应该初始化为最新日志的索引+1
 			rf.NextIndex[i] = len(rf.Log)
 		}
-		//rf.MatchIndex = make([]int, len(rf.peers))
-
-		rf.SuccessCount = make(map[int]int, 256)
-		// 新leader上任后，并不知道未提交的日志达成了多少的大多数，先投上自己一票
-		for i := rf.CommitIndex + 1; i < len(rf.Log); i++ {
-			rf.SuccessCount[i]++
-		}
+		rf.MatchIndex = make([]int, len(rf.peers))
 
 		rf.State = Leader
 
@@ -526,8 +515,9 @@ func (rf *Raft) sendHeartOrAppend() bool {
 			var entries LogEntries
 
 			// 一次最多同时发10个
-			for j := 0; j < 10 && j+rf.NextIndex[i] < len(rf.Log); j++ {
-				_, _ = DPrintf("Leader:%d 发现server:%d, 日志落后，现在可能需要日志:%d\n", rf.me, i, rf.NextIndex[i]+j)
+			j := 0
+			for ; j < 10 && j+rf.NextIndex[i] < len(rf.Log); j++ {
+
 				entries = LogEntries{
 					LogID:   j + rf.NextIndex[i],
 					TermID:  rf.Log[j+rf.NextIndex[i]].TermID,
@@ -536,14 +526,7 @@ func (rf *Raft) sendHeartOrAppend() bool {
 
 				args.Entries = append(args.Entries, entries)
 			}
-			//_, _ = DPrintf("Leader:%d 发现server:%d, 日志落后，现在可能需要日志:%d\n", rf.me, i, rf.NextIndex[i])
-			//entries = LogEntries{
-			//	LogID:   rf.NextIndex[i],
-			//	TermID:  rf.Log[rf.NextIndex[i]].TermID,
-			//	Command: rf.Log[rf.NextIndex[i]].Command,
-			//}
-			//args.Entries = []LogEntries{entries}
-			//_, _ = DPrintf("Leader:%d 任期为:%d 发送日志到follower:%d, logIndex:%d\n", rf.me, rf.CurrentTerm, i, rf.NextIndex[i])
+			_, _ = DPrintf("Leader:%d 发现server:%d, 日志落后，现在可能需要日志:%d~%d\n", rf.me, i, rf.NextIndex[i], rf.NextIndex[i]+j)
 
 			go rf.sendAppendEntries(i, &args, &reply)
 			continue
@@ -559,7 +542,7 @@ func (rf *Raft) sendHeartOrAppend() bool {
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
-		_, _ = DPrintf("leader %d to %d, sendAppendEntries -> Call Raft.AppendEntries error\n", rf.me, server)
+		//_, _ = DPrintf("leader %d to %d, sendAppendEntries -> Call Raft.AppendEntries error\n", rf.me, server)
 		return true
 	}
 
@@ -567,71 +550,56 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	defer rf.mu.Unlock()
 
 	// <-- 判断发送给follower的单个或者多个日志条目的append RPC是否返回ack -->
+	// leader不能主动提交旧日志&& rf.CurrentTerm == args.Entries[len(args.Entries)-1].TermID
 	if reply.Success && args.Entries != nil {
-		// 如果收到ack，则代表args内的日志全被接收了，这部分的日志的计数需要增加
-		if rf.NextIndex[server] != args.Entries[len(args.Entries)-1].LogID+1 {
-			for i := 0; i < len(args.Entries); i++ {
-				rf.SuccessCount[args.Entries[i].LogID]++
-				_, _ = DPrintf("leader:%d 收到follower:%d 的响应:%d ok\n", rf.me, server, args.Entries[i].LogID)
-				_, _ = DPrintf("日志:%d 目前达成%d个节点的同意\n", args.PrevLogIndex+1+i, rf.SuccessCount[args.Entries[i].LogID])
-			}
-		}
-
 		rf.NextIndex[server] = args.Entries[len(args.Entries)-1].LogID + 1
 		rf.MatchIndex[server] = args.Entries[len(args.Entries)-1].LogID
 
-		//_, _ = DPrintf("leader:%d 收到follower:%d 的响应:%d ok\n", rf.me, server, args.Entries[0].LogID)
-		//_, _ = DPrintf("日志:%d 目前达成%d个节点的同意\n", args.PrevLogIndex+1, rf.SuccessCount[args.Entries[0].LogID])
-	}
+		n := len(rf.peers)
 
-	// <-- 判断单个或者多个日志条目是否达成大多数 -->
-	if args.Entries != nil && args.Entries[len(args.Entries)-1].TermID == rf.CurrentTerm {
-
-	}
-	for i := 0; i < len(args.Entries); i++ {
-		if args.Entries != nil && rf.SuccessCount[args.Entries[i].LogID] > len(rf.peers)/2 {
-			if rf.SuccessCount[args.Entries[i].LogID] == len(rf.peers) {
-				delete(rf.SuccessCount, args.Entries[i].LogID)
-				_, _ = DPrintf("该日志:%d已被同步到所有follower\n", args.Entries[0].LogID)
+		for i := rf.CommitIndex + 1; i < len(rf.Log); i++ {
+			if rf.Log[i].TermID != rf.CurrentTerm {
+				continue
 			}
-			//flag.Do(func() {
-			if rf.CommitIndex < args.Entries[i].LogID {
-				rf.CommitIndex = args.Entries[i].LogID
+
+			cnt := 1 //记得自己也是大多数内一票
+			for j := 0; j < n; j++ {
+				// 节点最新已复制的日志索引
+				if rf.MatchIndex[j] > rf.CommitIndex {
+					cnt++
+				}
+			}
+			if cnt > n/2 {
+				for j := rf.CommitIndex + 1; j <= i; j++ {
+					applyMsg := ApplyMsg{
+						CommandValid: true,
+						Command:      rf.Log[j].Command,
+						CommandIndex: j,
+					}
+					rf.ApplyMsg <- applyMsg
+				}
+				rf.CommitIndex = i
+				//rf.CommitIndex = rf.MatchIndex[server]
 				_, _ = DPrintf("leader:%d 更新被提交的最高日志条目的索引为:%d\n", rf.me, rf.CommitIndex)
 
 				rf.LastApplied = rf.CommitIndex // 暂时直接提交=应用
 				_, _ = DPrintf("leader:%d 日志:%v", rf.me, rf.Log)
-				applyMsg := ApplyMsg{
-					CommandValid: true,
-					Command:      rf.Log[rf.CommitIndex].Command,
-					CommandIndex: rf.CommitIndex,
-				}
-				rf.ApplyMsg <- applyMsg
 			}
-			rf.CommitIndex = max(args.Entries[i].LogID, rf.CommitIndex)
-			_, _ = DPrintf("leader:%d 更新被提交的最高日志条目的索引为:%d\n", rf.me, rf.CommitIndex)
-
-			rf.LastApplied = rf.CommitIndex // 暂时直接提交=应用
-			_, _ = DPrintf("leader:%d 日志:%v", rf.me, rf.Log)
-			applyMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.Log[rf.CommitIndex].Command,
-				CommandIndex: rf.CommitIndex,
-			}
-			rf.ApplyMsg <- applyMsg
-			//})
 		}
+
+		//if cnt > n/2 && rf.CommitIndex < rf.MatchIndex[server] {
+		//
+		//}
 	}
+
+	// <-- 判断单个或者多个日志条目是否达成大多数 -->
+	//if args.Entries != nil && args.Entries[len(args.Entries)-1].TermID == rf.CurrentTerm {
+	//
+	//}
 
 	// 返回false的处理
 	// 此时返回的false可能是因为leader任期小于follower，或者follower日志不够新需要回退
 	if !reply.Success && reply.Term == rf.CurrentTerm && reply.HopeLogIndex != 0 {
-		// leader已经提交了，但是follower缺少日志在追的过程中，leader必须也先要投一票
-		for i := rf.NextIndex[server] - 1; i >= reply.HopeLogIndex; i-- {
-			if rf.SuccessCount[i] == 0 {
-				rf.SuccessCount[i]++
-			}
-		}
 		rf.NextIndex[server] = reply.HopeLogIndex // 回退日志
 		_, _ = DPrintf("leader:%d 收到follower:%d 的回退日志请求，回退到:%d\n", rf.me, server, rf.NextIndex[server])
 	} else if reply.Term > rf.CurrentTerm {
@@ -685,7 +653,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	_, _ = DPrintf("leader:%d 收到新日志:%d 追加请求\n", rf.me, len(rf.Log))
 	rf.Log = append(rf.Log, entries)
-	rf.SuccessCount[len(rf.Log)-1]++ //记得leader同步的日志也算进大多数内
 	_, _ = DPrintf("leader:%d 日志:%v\n", rf.me, rf.Log)
 	// 如果请求和心跳包两个是不同的发送appendRPC，那么请求有可能返回多次false，导致nextIndex不正常回退
 
@@ -840,7 +807,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.ResetChan = make(chan int, 10)
 	// // 将写入leader的日志内容，通过channel发送到负责心跳包的goroutine并且发送出去
 	rf.AppendEntriesChan = make(chan []LogEntries, 10)
-	rf.SuccessCount = make(map[int]int, 256)
 	rf.Ctx, rf.Cancel = context.WithCancel(context.Background())
 
 	// initialize from state persisted before a crash
