@@ -462,7 +462,6 @@ func (rf *Raft) sendRequestVote(server int, votesCount *int, args *RequestVoteAr
 	} else {
 		if reply.Term > rf.CurrentTerm {
 			rf.CurrentTerm = reply.Term
-			//rf.VotedFor = -1
 			rf.State = Follower
 			rf.persist()
 		}
