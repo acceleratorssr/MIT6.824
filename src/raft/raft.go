@@ -597,7 +597,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	// <-- 判断发送给follower的单个或者多个日志条目的append RPC是否返回ack -->
 	// leader不能主动提交旧日志&& rf.CurrentTerm == args.Entries[len(args.Entries)-1].TermID
-	if reply.Success && args.Entries != nil {
+	if reply.Success && args.Entries != nil && args.Term == rf.CurrentTerm {
 		rf.NextIndex[server] = args.Entries[len(args.Entries)-1].LogID + 1
 		rf.MatchIndex[server] = args.Entries[len(args.Entries)-1].LogID
 
@@ -843,6 +843,9 @@ func (rf *Raft) ticker() {
 					return
 				} else {
 					time.Sleep(100 * time.Millisecond)
+					if ct, ok = rf.GetState(); ok || ct != currentTerm || rf.killed() == true {
+						return
+					}
 				}
 			}
 		}()
