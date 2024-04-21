@@ -1,16 +1,18 @@
 #!/bin/bash
 
-max_attempts=30
+max_attempts=10
 attempts=0
+success_count=0
 
 while true; do
     ((attempts++))
     echo ""
     echo "Attempt $attempts"
 
-    if ! go test -run TestFailNoAgree2B; then
-        echo "Test failed, stopping."
-        break
+    if go test -run TestFigure8Unreliable2C; then
+        ((success_count++))
+    else
+        echo "Test failed"
     fi
 
     if [ $attempts -ge $max_attempts ]; then
@@ -18,3 +20,6 @@ while true; do
         break
     fi
 done
+
+success_rate=$(bc <<< "scale=2; $success_count / $attempts * 100")
+echo "Success rate: $success_rate%"

@@ -6,7 +6,7 @@ import (
 )
 
 // Debugging
-const Debug = false
+const Debug = true
 
 var (
 	debugLog *log.Logger
@@ -17,7 +17,7 @@ func init() {
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
-	debugLog = log.New(file, "DEBUG: ", log.Lshortfile)
+	debugLog = log.New(file, "", log.Lshortfile)
 }
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
