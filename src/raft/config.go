@@ -267,13 +267,11 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 	}
 }
 
-//
 // start or re-start a Raft.
 // if one already exists, "kill" it first.
 // allocate new outgoing port file names, and a new
 // state persister, to isolate previous instance of
 // this server. since we cannot really kill it.
-//
 func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	cfg.crash1(i)
 
@@ -422,13 +420,11 @@ func (cfg *config) setlongreordering(longrel bool) {
 	cfg.net.LongReordering(longrel)
 }
 
-//
 // check that one of the connected servers thinks
 // it is the leader, and that no other connected
 // server thinks otherwise.
 //
 // try a few times in case re-elections are needed.
-//
 func (cfg *config) checkOneLeader() int {
 	for iters := 0; iters < 10; iters++ {
 		ms := 450 + (rand.Int63() % 100)
@@ -477,10 +473,8 @@ func (cfg *config) checkTerms() int {
 	return term
 }
 
-//
 // check that none of the connected servers
 // thinks it is the leader.
-//
 func (cfg *config) checkNoLeader() {
 	for i := 0; i < cfg.n; i++ {
 		if cfg.connected[i] {
@@ -631,11 +625,11 @@ func (cfg *config) end() {
 	cfg.checkTimeout()
 	if cfg.t.Failed() == false {
 		cfg.mu.Lock()
-		t := time.Since(cfg.t0).Seconds()       // real time
-		npeers := cfg.n                         // number of Raft peers
-		nrpc := cfg.rpcTotal() - cfg.rpcs0      // number of RPC sends
-		nbytes := cfg.bytesTotal() - cfg.bytes0 // number of bytes
-		ncmds := cfg.maxIndex - cfg.maxIndex0   // number of Raft agreements reported
+		t := time.Since(cfg.t0).Seconds()       // 测试的实际运行时间（以秒为单位）
+		npeers := cfg.n                         // Raft 对等节点的数量
+		nrpc := cfg.rpcTotal() - cfg.rpcs0      // Raft 对等节点的数量
+		nbytes := cfg.bytesTotal() - cfg.bytes0 // 发送的总字节数
+		ncmds := cfg.maxIndex - cfg.maxIndex0   // Raft 协议达成一致的总次数
 		cfg.mu.Unlock()
 
 		fmt.Printf("  ... Passed --")
