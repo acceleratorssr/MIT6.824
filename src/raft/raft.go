@@ -106,7 +106,6 @@ type Raft struct {
 	Ctx               context.Context
 	Cancel            context.CancelFunc
 	Wg                sync.WaitGroup
-	Cond              *sync.Cond
 }
 
 // GetState return currentTerm，以及此服务器是否认为自己是leader。
@@ -172,11 +171,25 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
-// Snapshot the service says it has created a snapshot that has all info up to and including index. this means the service no longer needs the log through (and including) that index. Raft should now trim its log as much as possible.
-// 该服务表示，它已经创建了一个快照，其中包含索引之前的所有信息。这意味着服务不再需要通过（包括）该索引进行日志记录。木筏现在应该尽可能多地修剪原木。
+// Snapshot the service says it has created a snapshot that has all info up to and including index.
+// this means the service no longer needs the log through (and including) that index.
+// Raft should now trim its log as much as possible.
+// 该服务表示，它已经创建了一个快照，其中包含索引之前的所有信息
+// 这意味着服务不再需要通过（包括）该索引进行日志记录
+// raft现在应该尽可能多地修剪log
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+	//copy(snapshot, rf.Log[:])
+	rf.Log = rf.Log[index-rf.Log[0].LogID:]
+	//for i := range rf.peers {
+	//	rf.NextIndex[i] -= index
+	//}
+	if len(rf.Log) == 0 {
+		rf.Log = append(rf.Log, LogEntries{})
+	}
+	_, _ = DPrintf("server:%d 压缩日志，从index:%d 开始\n", rf.me, index)
 }
 
 // RequestVoteArgs 示例RequestVote RPC参数结构。
@@ -209,7 +222,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term               int  // 当前任期
 	Success            bool // 如果日志条目顺序匹配，则返回true
-	HopeLogIndex       int  //当前follower期望最新日志
 	ConflictTerm       int  //冲突的term
 	ConflictFirstIndex int  //该term的第一个日志的index值
 }
@@ -316,32 +328,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// <-- 处理follower日志落后n条的问题 -->
-	if args.PrevLogIndex > len(rf.Log)-1 {
+	if args.PrevLogIndex > rf.Log[len(rf.Log)-1].LogID {
 		_, _ = DPrintf("args.PrevLogIndex, PrevLogTerm:%d %d\n", args.PrevLogIndex, args.PrevLogTerm)
 		_, _ = DPrintf("follower:%d 日志落后超过一个日志条目\n", rf.me)
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
 
-		reply.ConflictFirstIndex = len(rf.Log)
+		reply.ConflictFirstIndex = rf.Log[len(rf.Log)-1].LogID
 		reply.ConflictTerm = -1
-		_, _ = DPrintf("follower:%d 期望日志索引:%d\n", rf.me, len(rf.Log))
+		_, _ = DPrintf("follower:%d 期望日志索引:%d\n", rf.me, rf.Log[len(rf.Log)-1].LogID)
 		_, _ = DPrintf("follower:%d 日志:%v\n", rf.me, rf.Log)
 		return
 	}
 
 	// <-- 处理日志期望对应的任期不匹配的问题 -->
 	// 如果日志在prevLogIndex处不包含term与prevLogTerm匹配的条目，则返回false，表示需要回退；
-	if args.PrevLogTerm != rf.Log[args.PrevLogIndex].TermID {
+	if args.PrevLogTerm != rf.Log[args.PrevLogIndex-rf.Log[0].LogID].TermID {
 		_, _ = DPrintf("follower:%d 日志在prevLogIndex:%d 处不包含term:%d 与prevLogTerm:%d 匹配的条目\n",
-			rf.me, args.PrevLogIndex, rf.Log[args.PrevLogIndex].TermID, args.PrevLogTerm)
+			rf.me, args.PrevLogIndex, rf.Log[args.PrevLogIndex-rf.Log[0].LogID].TermID, args.PrevLogTerm)
 		_, _ = DPrintf("follower:%d 日志落后超过一个日志条目\n", rf.me)
 
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
 
-		reply.ConflictTerm = rf.Log[args.PrevLogIndex].TermID
-		for i := 1; i <= args.PrevLogIndex; i++ {
-			if rf.Log[i].TermID == reply.ConflictTerm {
+		reply.ConflictTerm = rf.Log[args.PrevLogIndex-rf.Log[0].LogID].TermID
+		for i := rf.Log[0].LogID; i <= args.PrevLogIndex; i++ {
+			if rf.Log[i-rf.Log[0].LogID].TermID == reply.ConflictTerm {
 				reply.ConflictFirstIndex = i
 				break
 			}
@@ -359,13 +371,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	cnt := 0 //重复的日志条目数量
 	if args.Entries != nil {
 		for i := 0; i < len(args.Entries); i++ {
-			if len(rf.Log) > args.PrevLogIndex+1+i && args.Entries[i].TermID != rf.Log[args.PrevLogIndex+1+i].TermID {
-				_, _ = DPrintf("server:%d 一个现有的条目任期%d 与一个新的条目任期%d 相冲突\n", rf.me, rf.Log[args.PrevLogIndex+1+i].TermID, args.Entries[i].TermID)
+			//rf.Log[len(rf.Log)-1].LogID  +1?
+			if rf.Log[len(rf.Log)-1].LogID >= args.PrevLogIndex+1+i && args.Entries[i-rf.Log[0].LogID].TermID != rf.Log[args.PrevLogIndex+1+i-rf.Log[0].LogID].TermID {
+				_, _ = DPrintf("server:%d 一个现有的条目任期%d 与一个新的条目任期%d 相冲突\n", rf.me, rf.Log[args.PrevLogIndex+1+i-rf.Log[0].LogID].TermID, args.Entries[i-rf.Log[0].LogID].TermID)
 				rf.Log = rf.Log[:args.PrevLogIndex+1+i]
 				_, _ = DPrintf("server:%d 日志:%v\n", rf.me, rf.Log)
 				rf.persist()
 				break
-			} else if len(rf.Log) > args.PrevLogIndex+1+i && args.Entries[i].TermID == rf.Log[args.PrevLogIndex+1+i].TermID { //重复的日志条目, 相同索引和任期，值应该不可能不相同
+			} else if rf.Log[len(rf.Log)-1].LogID >= args.PrevLogIndex+1+i && args.Entries[i-rf.Log[0].LogID].TermID == rf.Log[args.PrevLogIndex+1+i-rf.Log[0].LogID].TermID { //重复的日志条目, 相同索引和任期，值应该不可能不相同
 				cnt++
 			}
 		}
@@ -404,13 +417,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// <--    检查是否需要提交日志 	-->
 	// 提交 rf.commitIndex 到 leaderCommit 之间的日志
-	args.LeaderCommit = min(args.LeaderCommit, len(rf.Log)-1) // 0不是日志，从1开始
+	//args.LeaderCommit = min(args.LeaderCommit, len(rf.Log)-1) // 0不是日志，从1开始
+	args.LeaderCommit = min(args.LeaderCommit, rf.Log[len(rf.Log)-1].LogID)
 	if args.LeaderCommit > rf.CommitIndex {
 		_, _ = DPrintf("follower:%d 更新最新的提交日志索引: %d\n", rf.me, args.LeaderCommit)
 		for i := rf.CommitIndex + 1; i <= args.LeaderCommit; i++ {
 			applyMsg := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.Log[i].Command,
+				Command:      rf.Log[i-rf.Log[0].LogID].Command,
 				CommandIndex: i,
 			}
 			rf.ApplyMsg <- applyMsg // 小心阻塞
@@ -498,13 +512,14 @@ func (rf *Raft) sendRequestVote(server int, hadVote *sync.Map, args *RequestVote
 			rf.NextIndex = make([]int, len(rf.peers))
 			for i := range rf.NextIndex {
 				// leader不可能覆盖自己的日志，所有应该初始化为最新日志的索引+1
-				rf.NextIndex[i] = len(rf.Log)
+				//rf.NextIndex[i] = len(rf.Log)
+				rf.NextIndex[i] = rf.Log[len(rf.Log)-1].LogID + 1
 			}
 			rf.MatchIndex = make([]int, len(rf.peers))
 
 			rf.Wg.Wait()
 
-			rf.Ctx, rf.Cancel = context.WithCancel(context.Background())
+			rf.Ctx, rf.Cancel = context.WithCancel(rf.parentCtx)
 
 			rf.State = Leader
 
@@ -564,14 +579,14 @@ func (rf *Raft) sendHeartOrAppend() bool {
 			Term:         rf.CurrentTerm,
 			LeaderID:     rf.me,
 			PrevLogIndex: rf.NextIndex[i] - 1,
-			PrevLogTerm:  rf.Log[rf.NextIndex[i]-1].TermID,
+			PrevLogTerm:  rf.Log[rf.NextIndex[i]-1-rf.Log[0].LogID].TermID,
 			LeaderCommit: rf.CommitIndex,
 		}
 		reply := AppendEntriesReply{}
 
-		if args.PrevLogIndex < len(rf.Log)-1 {
-			args.Entries = make([]LogEntries, len(rf.Log)-rf.NextIndex[i])
-			copy(args.Entries, rf.Log[rf.NextIndex[i]:])
+		if args.PrevLogIndex < rf.Log[len(rf.Log)-1].LogID {
+			args.Entries = make([]LogEntries, rf.Log[len(rf.Log)-1].LogID-rf.NextIndex[i]+1)
+			copy(args.Entries, rf.Log[rf.NextIndex[i]-rf.Log[0].LogID:])
 			_, _ = DPrintf("Leader:%d 发现server:%d, 日志落后，现在可能需要日志:%d, 本身日志数量%d\n", rf.me, i, rf.NextIndex[i], len(rf.Log))
 
 			go rf.sendAppendEntries(i, &args, &reply)
@@ -605,9 +620,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 		// i代表当前需要判断是否达成大多数的一条日志条目
 		// 这里应该是判断：直到 全部日志，还是仅判断： 直到follower返回的最新同步日志?
-		//for i := rf.CommitIndex + 1; i < len(rf.Log); i++ {
 		for i := rf.CommitIndex + 1; i < rf.NextIndex[server]; i++ {
-			if rf.Log[i].TermID != rf.CurrentTerm {
+			if rf.Log[i-rf.Log[0].LogID].TermID != rf.CurrentTerm {
 				continue
 			}
 
@@ -625,7 +639,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				for j := rf.CommitIndex + 1; j <= i; j++ {
 					applyMsg := ApplyMsg{
 						CommandValid: true,
-						Command:      rf.Log[j].Command,
+						Command:      rf.Log[j-rf.Log[0].LogID].Command,
 						CommandIndex: j,
 					}
 					rf.ApplyMsg <- applyMsg
@@ -658,14 +672,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		} else {
 			var i int
 
-			for i = args.PrevLogIndex; i > 0 && rf.Log[i].TermID >= reply.ConflictTerm; i-- {
-				if rf.Log[i].TermID == reply.ConflictTerm {
+			for i = args.PrevLogIndex; i > 0 && rf.Log[i-rf.Log[0].LogID].TermID >= reply.ConflictTerm; i-- {
+				if rf.Log[i-rf.Log[0].LogID].TermID == reply.ConflictTerm {
 					rf.NextIndex[server] = i + 1
 					break
 				}
 			}
 
-			if rf.Log[i].TermID < reply.ConflictTerm {
+			if rf.Log[i-rf.Log[0].LogID].TermID < reply.ConflictTerm {
 				rf.NextIndex[server] = reply.ConflictFirstIndex
 			}
 		}
@@ -706,7 +720,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	index := len(rf.Log) //注意此处是leader确定下一个需要被提交的日志的index
+	index := rf.Log[len(rf.Log)-1].LogID + 1 //注意此处是leader确定下一个需要被提交的日志的index
 	// 这里没写重定向到leader
 	if !isLeader {
 		//_, _ = DPrintf("follower:%d return CommitIndex:%d\n", rf.me, rf.CommitIndex)
@@ -715,12 +729,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	entries := LogEntries{
-		LogID:   len(rf.Log),
+		LogID:   rf.Log[len(rf.Log)-1].LogID + 1,
 		TermID:  rf.CurrentTerm,
 		Command: command,
 	}
 
-	_, _ = DPrintf("leader:%d 收到新日志:%d 追加请求\n", rf.me, len(rf.Log))
+	_, _ = DPrintf("leader:%d 收到新日志:%d 追加请求\n", rf.me, rf.Log[len(rf.Log)-1].LogID+1)
 	rf.Log = append(rf.Log, entries)
 	_, _ = DPrintf("leader:%d 日志:%v\n", rf.me, rf.Log)
 	// 如果请求和心跳包两个是不同的发送appendRPC，那么请求有可能返回多次false，导致nextIndex不正常回退
@@ -766,7 +780,7 @@ func randomDuration() time.Duration {
 	generator := rand.New(source)
 
 	// 生成一个介于 0 到 400 之间的随机数，加上 700，得到随机范围内的毫秒数
-	randomMilliseconds := generator.Intn(400) + 400
+	randomMilliseconds := generator.Intn(150) + 300
 	// 将毫秒数转换为 Duration 类型
 	duration := time.Duration(randomMilliseconds) * time.Millisecond
 	return duration
@@ -812,7 +826,7 @@ func (rf *Raft) ticker() {
 		rf.State = Candidate
 		rf.persist()
 		currentTerm := rf.CurrentTerm
-		lastLogIndex := len(rf.Log) - 1
+		lastLogIndex := rf.Log[len(rf.Log)-1].LogID
 		lastLogTerm := rf.Log[len(rf.Log)-1].TermID
 		rf.mu.Unlock()
 

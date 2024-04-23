@@ -627,7 +627,7 @@ func (cfg *config) end() {
 		cfg.mu.Lock()
 		t := time.Since(cfg.t0).Seconds()       // 测试的实际运行时间（以秒为单位）
 		npeers := cfg.n                         // Raft 对等节点的数量
-		nrpc := cfg.rpcTotal() - cfg.rpcs0      // Raft 对等节点的数量
+		nrpc := cfg.rpcTotal() - cfg.rpcs0      // RPC发送数目
 		nbytes := cfg.bytesTotal() - cfg.bytes0 // 发送的总字节数
 		ncmds := cfg.maxIndex - cfg.maxIndex0   // Raft 协议达成一致的总次数
 		cfg.mu.Unlock()
