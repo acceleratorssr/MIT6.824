@@ -161,7 +161,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 	for m := range applyCh {
 		if m.CommandValid == false {
-			// ignore other types of ApplyMsg
+			// ignore other types of applyMsg
 		} else {
 			cfg.mu.Lock()
 			err_msg, prevok := cfg.checkLogs(i, m)
@@ -256,7 +256,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 				rf.Snapshot(m.CommandIndex, w.Bytes())
 			}
 		} else {
-			// Ignore other types of ApplyMsg.
+			// Ignore other types of applyMsg.
 		}
 		if err_msg != "" {
 			log.Fatalf("apply error: %v", err_msg)

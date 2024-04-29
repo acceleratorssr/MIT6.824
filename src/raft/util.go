@@ -6,7 +6,9 @@ import (
 )
 
 // Debugging
-const Debug = true
+const Debug = false
+
+//const Debug = true
 
 var (
 	debugLog *log.Logger
@@ -22,7 +24,8 @@ func init() {
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
-		debugLog.Printf(format, a...)
+		//debugLog.Printf(format, a...)
+		log.Printf(format, a...)
 	}
 	return
 }

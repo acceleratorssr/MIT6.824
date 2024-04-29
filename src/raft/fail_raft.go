@@ -71,9 +71,22 @@ package raft
 //	Command interface{}
 //}
 //
-//type LogSuccessCount struct {
-//	SuccessCount map[int]int
-//	LogIndex     int
+////	type LogSuccessCount struct {
+////		SuccessCount map[int]int
+////		LogIndex     int
+////	}
+//type InstallSnapshotArgs struct {
+//	Term              int    //leader的任期
+//	LeaderId          int    //leader的ID，这样follower才可以重定向客户端的请求
+//	LastIncludedIndex int    //最后一个被快照取代的日志条目的索引值
+//	LastIncludedTerm  int    //LastIncludedIndex所处的任期号
+//	Offset            int    //数据块在快照文件中位置的字节偏移量
+//	Data              []byte //从偏移量开始快照块的原始字节数据
+//	Done              bool   //表示是否为最后一个快照块
+//}
+//
+//type InstallSnapshotReply struct {
+//	Term int //当前的任期，可使leader自我更新
 //}
 //
 //// Raft 实现单个Raft对等体的Go对象。
@@ -99,14 +112,16 @@ package raft
 //	NextIndex  []int // 对于每个服务器，要发送给该服务器的下一个日志条目的索引（初始化为领导者的最后一个日志索引+1）
 //	MatchIndex []int // 对于每个服务器，已知在服务器上复制的最高日志条目的索引（初始化为0，单调增加）
 //
-//	State     int32
-//	resetChan chan int
-//	over      chan int //完成投票的channel
-//	applyMsg  chan applyMsg
-//	ctx       context.Context
-//	cancel    context.CancelFunc
-//
-//	//AppendEntriesChan chan []LogEntries
+//	State             int32
+//	resetChan         chan int
+//	AppendEntriesChan chan []LogEntries
+//	applyMsg          chan applyMsg
+//	parentCtx         context.Context
+//	ctx               context.Context
+//	cancel            context.CancelFunc
+//	wg                sync.WaitGroup
+//	LastIncludedTerm  int //LastIncludedIndex所处的任期号
+//	LastIncludedIndex int //最后一个被快照取代的日志条目的索引值
 //}
 //
 //// GetState return currentTerm，以及此服务器是否认为自己是leader。
@@ -153,9 +168,16 @@ package raft
 //		rf.CurrentTerm = currentTerm
 //		rf.VotedFor = voteFor
 //		rf.Log = log
+//		//rf.CommitIndex=
 //		_, _ = DPrintf("server:%d 恢复状态为: currentTerm: %d, voteFor: %d log: %v\n",
 //			rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log)
 //	}
+//	//if rf.State == Leader {
+//	//	_, _ = DPrintf("server:%d 重启后状态变回follower\n", rf.me)
+//	//	rf.cancel()
+//	//	rf.State = Follower
+//	//}
+//
 //}
 //
 //// CondInstallSnapshot 服务希望切换到快照。只有当Raft在applyCh上传递快照后没有更新的信息时才这样做。
@@ -166,11 +188,42 @@ package raft
 //	return true
 //}
 //
-//// Snapshot the service says it has created a snapshot that has all info up to and including index. this means the service no longer needs the log through (and including) that index. Raft should now trim its log as much as possible.
-//// 该服务表示，它已经创建了一个快照，其中包含索引之前的所有信息。这意味着服务不再需要通过（包括）该索引进行日志记录。木筏现在应该尽可能多地修剪原木。
+//// Snapshot the service says it has created a snapshot that has all info up to and including index.
+//// this means the service no longer needs the log through (and including) that index.
+//// Raft should now trim its log as much as possible.
+//// 该服务表示，它已经创建了一个快照，其中包含索引之前的所有信息
+//// 这意味着服务不再需要通过（包括）该索引进行日志记录
+//// raft现在应该尽可能多地修剪log
 //func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //	// Your code here (2D).
+//	//rf.mu.Lock() // 打开后会阻塞
+//	//defer rf.mu.Unlock()
 //
+//	w := new(bytes.Buffer)
+//	e := labgob.NewEncoder(w)
+//	e.Encode(rf.CurrentTerm)
+//	e.Encode(rf.VotedFor)
+//	e.Encode(rf.Log)
+//	dataState := w.Bytes()
+//
+//	w = new(bytes.Buffer)
+//	e = labgob.NewEncoder(w)
+//	e.Encode(rf.Log[:index-rf.Log[0].LogID])
+//	dataSnapshot := w.Bytes()
+//	snapshot = append(snapshot, dataSnapshot...)
+//
+//	rf.persister.SaveStateAndSnapshot(dataState, snapshot)
+//
+//	//rf.LastIncludedTerm = rf.Log[index-rf.Log[0].LogID].TermID
+//	rf.LastIncludedTerm = rf.Log[index-rf.LastIncludedIndex-1].TermID
+//	rf.Log = rf.Log[index-rf.LastIncludedIndex:] // 此处不保留index
+//	rf.LastIncludedIndex = index
+//	//rf.Log = rf.Log[index-rf.Log[0].LogID:] // 此处index仍然保留
+//
+//	//for i := range rf.peers {
+//	//	rf.NextIndex[i] -= index
+//	//}
+//	_, _ = DPrintf("server:%d 压缩日志，从index+1:%d 开始, log:%v\n", rf.me, index+1, rf.Log)
 //}
 //
 //// RequestVoteArgs 示例RequestVote RPC参数结构。
@@ -205,6 +258,7 @@ package raft
 //	Success            bool // 如果日志条目顺序匹配，则返回true
 //	ConflictTerm       int  //冲突的term
 //	ConflictFirstIndex int  //该term的第一个日志的index值
+//	NeedSnapshot       bool //表示是否需要快照
 //}
 //
 //// RequestVote RPC处理程序示例
@@ -228,16 +282,15 @@ package raft
 //	// 即使投false，也要更新到候选人的任期
 //	// 如果反对投票，follower任期大于leader,leader直接下岗,然后任一节点超时发起选举，有最新已提交日志的才有可能胜选
 //	if args.LastLogTerm < rf.Log[len(rf.Log)-1].TermID { // 任期号大的更新
+//		rf.CurrentTerm = args.Term
 //		reply.Term = rf.CurrentTerm
 //		reply.VoteGranted = false
 //		// 能到这一步说明：当前任期小于RPC内的任期了，所以无论结果如何，都不能进行当leader了
 //		if rf.State == Leader {
-//			_, _ = DPrintf("server: %d, 当前任期: %d 小于投票RPC的任期: %d，且日志任期比投票RPC新,leader转为follower\n", rf.me, rf.CurrentTerm, args.Term)
 //			rf.cancel()
 //			rf.State = Follower
 //		}
 //		_, _ = DPrintf("server:%d 接收到节点:%d的投票请求，它的任期为:%d，最新日志任期和索引为:%d,%d，任期大于当前任期，但是日志不是最新的，故拒绝投票\n", rf.me, args.CandidateID, args.Term, args.LastLogTerm, args.LastLogIndex)
-//		rf.CurrentTerm = args.Term
 //		rf.persistL() // 此处可能会更新节点当前任期
 //		return
 //	}
@@ -248,7 +301,6 @@ package raft
 //		reply.VoteGranted = false
 //		// 能到这一步说明：当前任期小于RPC内的任期了，所以无论结果如何，都不能进行当leader了
 //		if rf.State == Leader {
-//			_, _ = DPrintf("server: %d, 当前任期: %d 小于投票RPC的任期: %d，leader转为follower\n", rf.me, rf.CurrentTerm, args.Term)
 //			rf.cancel()
 //			rf.State = Follower
 //		}
@@ -259,26 +311,27 @@ package raft
 //
 //	// <-- 处理任期不匹配的问题 -->
 //	// 此时如果下一个投票请求任期高于当前任期，则直接向他投票；
-//	if args.Term > rf.CurrentTerm {
-//		//rf.resetChan <- 1 // 请求投票RPC也会刷新计时，之前忘了加
-//		rf.VotedFor = args.CandidateID
-//		rf.CurrentTerm = args.Term // 更新follower的任期为候选人的任期
+//	//if args.Term > rf.CurrentTerm {
+//	//rf.resetChan <- 1 // 请求投票RPC也会刷新计时，之前忘了加
+//	rf.VotedFor = args.CandidateID
+//	rf.CurrentTerm = args.Term // 更新follower的任期为候选人的任期
 //
-//		if rf.State == Candidate {
-//			rf.State = Follower
-//		} else if rf.State == Leader {
-//			rf.State = Follower
-//			_, _ = DPrintf("old leader:%d 发现自己任期小于candidate:%d 故变回follower\n ", rf.me, args.CandidateID)
-//			rf.cancel()
-//		}
-//		reply.Term = rf.CurrentTerm
-//		reply.VoteGranted = true
-//		_, _ = DPrintf("server:%d 投票给了:%d\n", rf.me, args.CandidateID)
-//
-//		rf.resetChan <- 1 // 通知ticker重新初始化
-//		rf.persistL()
-//		return
+//	if rf.State == Candidate {
+//		rf.State = Follower
+//	} // 此处不能用else？
+//	if rf.State == Leader {
+//		rf.State = Follower
+//		_, _ = DPrintf("old leader:%d 发现自己任期小于candidate:%d 故变回follower\n ", rf.me, args.CandidateID)
+//		rf.cancel()
 //	}
+//	reply.Term = rf.CurrentTerm
+//	reply.VoteGranted = true
+//	_, _ = DPrintf("server:%d 投票给了:%d\n", rf.me, args.CandidateID)
+//
+//	rf.resetChan <- 1 // 通知ticker重新初始化
+//	rf.persistL()
+//	return
+//	//}
 //
 //}
 //
@@ -302,81 +355,90 @@ package raft
 //			rf.State = Follower
 //			rf.cancel()
 //			_, _ = DPrintf("旧leader:%d 转变为follower\n", rf.me)
+//		} else if rf.State == Candidate {
+//			rf.State = Follower
+//			_, _ = DPrintf("旧candidate:%d 转变为follower\n", rf.me)
 //		}
-//		//else if rf.State == Candidate {
-//		//	rf.State = Follower
-//		//}
 //		rf.persistL()
 //	}
 //
+//	var atLastIndex int
+//	if len(rf.Log) != 0 {
+//		atLastIndex = rf.Log[len(rf.Log)-1].LogID
+//	} else {
+//		atLastIndex = rf.LastIncludedIndex
+//	}
+//
 //	// <-- 处理follower日志落后n条的问题 -->
-//	if args.PrevLogIndex > len(rf.Log)-1 {
-//		_, _ = DPrintf("follower:%d args.PrevLogIndex, PrevLogTerm:%d %d\n", rf.me, args.PrevLogIndex, args.PrevLogTerm)
+//	if args.PrevLogIndex > atLastIndex {
+//		_, _ = DPrintf("args.PrevLogIndex, PrevLogTerm:%d %d\n", args.PrevLogIndex, args.PrevLogTerm)
 //		_, _ = DPrintf("follower:%d 日志落后超过一个日志条目\n", rf.me)
 //		reply.Term = rf.CurrentTerm
 //		reply.Success = false
 //
-//		reply.ConflictFirstIndex = len(rf.Log)
-//		reply.ConflictTerm = 0
-//
-//		//_, _ = DPrintf("follower:%d 期望日志索引:%d\n", rf.me, reply.HopeLogIndex)
+//		reply.ConflictFirstIndex = atLastIndex
+//		reply.ConflictTerm = -1
+//		_, _ = DPrintf("follower:%d 期望日志索引:%d\n", rf.me, rf.Log[len(rf.Log)-1].LogID)
 //		_, _ = DPrintf("follower:%d 日志:%v\n", rf.me, rf.Log)
 //		return
 //	}
 //
 //	// <-- 处理日志期望对应的任期不匹配的问题 -->
 //	// 如果日志在prevLogIndex处不包含term与prevLogTerm匹配的条目，则返回false，表示需要回退；
-//	if args.PrevLogTerm != rf.Log[args.PrevLogIndex].TermID {
-//		//_, _ = DPrintf("args.PrevLogIndex, PrevLogTerm:%d %d\n", args.PrevLogIndex, args.PrevLogTerm)
+//	//if args.PrevLogTerm != rf.Log[args.PrevLogIndex-rf.Log[0].LogID].TermID {
+//	if args.PrevLogTerm != rf.Log[args.PrevLogIndex-rf.LastIncludedIndex-1].TermID {
 //		_, _ = DPrintf("follower:%d 日志在prevLogIndex:%d 处不包含term:%d 与prevLogTerm:%d 匹配的条目\n",
-//			rf.me, args.PrevLogIndex, rf.Log[args.PrevLogIndex].TermID, args.PrevLogTerm)
+//			rf.me, args.PrevLogIndex, rf.Log[args.PrevLogIndex-rf.LastIncludedIndex-1].TermID, args.PrevLogTerm)
 //		_, _ = DPrintf("follower:%d 日志落后超过一个日志条目\n", rf.me)
 //
 //		reply.Term = rf.CurrentTerm
 //		reply.Success = false
 //
-//		reply.ConflictTerm = rf.Log[args.PrevLogIndex].TermID
-//		//for i := args.PrevLogIndex; rf.Log[i].TermID == reply.ConflictTerm; i-- {
-//		//	reply.ConflictFirstIndex = i
-//		//}
-//		for i := 0; i <= args.PrevLogIndex; i++ {
-//			if rf.Log[i].TermID == reply.ConflictTerm {
+//		reply.ConflictTerm = rf.Log[args.PrevLogIndex-rf.LastIncludedIndex-1].TermID
+//		for i := rf.Log[0].LogID; i <= args.PrevLogIndex; i++ {
+//			if rf.Log[i-rf.LastIncludedIndex-1].TermID == reply.ConflictTerm {
 //				reply.ConflictFirstIndex = i
 //				break
 //			}
 //		}
 //
-//		//_, _ = DPrintf("follower:%d 期望日志索引:%d\n", rf.me, reply.HopeLogIndex)
-//		_, _ = DPrintf("follower:%d 返回冲突的term: %d, 及该term的第一个日志的index值:%d \n", rf.me, reply.ConflictTerm, reply.ConflictFirstIndex)
+//		_, _ = DPrintf("follower:%d 期望日志索引:%d\n", rf.me, reply.ConflictFirstIndex)
 //		_, _ = DPrintf("follower:%d 日志:%v\n", rf.me, rf.Log)
 //		return
 //	}
 //
 //	// <-- 检查新日志是否与已有日志冲突 -->
 //	// 如果一个现有的条目与一个新的条目相冲突（相同索引但是不同任期），则删除现有条目和后面所有条目
+//	// 如果leader发来的日志，就是当前follower拥有的最新日志，这里先这样处理：直接返回false
 //	// len(rf.Log) 是follower将存放新日志的位置，args.PrevLogIndex+1 是将要追加的新日志期望存放的位置
 //	cnt := 0 //重复的日志条目数量
 //	if args.Entries != nil {
 //		for i := 0; i < len(args.Entries); i++ {
-//			if len(rf.Log) > args.PrevLogIndex+1+i && args.Entries[i].TermID != rf.Log[args.PrevLogIndex+1+i].TermID {
-//				_, _ = DPrintf("server:%d 一个现有的条目任期%d 与一个新的条目任期%d 相冲突\n", rf.me, rf.Log[args.PrevLogIndex+1+i].TermID, args.Entries[i].TermID)
+//			//rf.Log[len(rf.Log)-1].LogID  +1?
+//			if rf.Log[len(rf.Log)-1].LogID >= args.PrevLogIndex+1+i && args.Entries[i-rf.LastIncludedIndex-1].TermID != rf.Log[args.PrevLogIndex+1+i-rf.LastIncludedIndex-1].TermID {
+//				_, _ = DPrintf("server:%d 一个现有的条目任期%d 与一个新的条目任期%d 相冲突\n", rf.me, rf.Log[args.PrevLogIndex+1+i-rf.LastIncludedIndex-1].TermID, args.Entries[i-rf.LastIncludedIndex-1].TermID)
 //				rf.Log = rf.Log[:args.PrevLogIndex+1+i]
 //				_, _ = DPrintf("server:%d 日志:%v\n", rf.me, rf.Log)
 //				rf.persistL()
 //				break
-//				//  省掉
-//			} else if len(rf.Log) > args.PrevLogIndex+1+i && args.Entries[i].TermID == rf.Log[args.PrevLogIndex+1+i].TermID { //重复的日志条目, 相同索引和任期，值应该不可能不相同
+//			} else if rf.Log[len(rf.Log)-1].LogID >= args.PrevLogIndex+1+i && args.Entries[i-rf.LastIncludedIndex-1].TermID == rf.Log[args.PrevLogIndex+1+i-rf.LastIncludedIndex-1].TermID { //重复的日志条目, 相同索引和任期，值应该不可能不相同
 //				cnt++
 //			}
 //		}
+//		//if cnt == len(args.Entries) { //日志全是重复的，不需要append
+//		//	_, _ = DPrintf("server:%d 收到重复的相同日志: %d~%d\n", rf.me, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries))
+//		//	reply.Term = rf.CurrentTerm
+//		//	reply.Success = true
+//		//	return
+//		//}
 //	}
 //
 //	// <-- 检查是否含有日志 -->
 //	if args.Entries == nil {
-//		// 如果此时节点还是candidate时,收到新leader心跳包,且其任期大于等于自己,则会转变回follower
-//		if rf.State == Candidate && rf.CurrentTerm <= args.Term {
-//			rf.State = Follower
-//		}
+//		//// 如果此时节点还是candidate时,收到新leader心跳包,且其任期大于等于自己,则会转变回follower
+//		//if rf.State == Candidate && rf.CurrentTerm <= args.Term {
+//		//	rf.State = Follower
+//		//}
 //
 //		// 表示为心跳包
 //		rf.resetChan <- 1 // 继续睡眠
@@ -398,13 +460,14 @@ package raft
 //
 //	// <--    检查是否需要提交日志 	-->
 //	// 提交 rf.commitIndex 到 leaderCommit 之间的日志
-//	args.LeaderCommit = min(args.LeaderCommit, len(rf.Log)-1) // 0不是日志，从1开始
+//	//args.LeaderCommit = min(args.LeaderCommit, len(rf.Log)-1) // 0不是日志，从1开始
+//	args.LeaderCommit = min(args.LeaderCommit, rf.Log[len(rf.Log)-1].LogID)
 //	if args.LeaderCommit > rf.CommitIndex {
 //		_, _ = DPrintf("follower:%d 更新最新的提交日志索引: %d\n", rf.me, args.LeaderCommit)
 //		for i := rf.CommitIndex + 1; i <= args.LeaderCommit; i++ {
 //			applyMsg := applyMsg{
 //				CommandValid: true,
-//				Command:      rf.Log[i].Command,
+//				Command:      rf.Log[i-rf.LastIncludedIndex-1].Command,
 //				CommandIndex: i,
 //			}
 //			rf.applyMsg <- applyMsg // 小心阻塞
@@ -416,6 +479,57 @@ package raft
 //		reply.Term = rf.CurrentTerm
 //		reply.Success = true
 //	}
+//}
+//
+//func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+//	rf.resetChan <- 1
+//
+//	rf.mu.Lock()
+//	defer rf.mu.Unlock()
+//
+//	if args.Term < rf.CurrentTerm {
+//		reply.Term = rf.CurrentTerm
+//		return
+//	} else if args.Term > rf.CurrentTerm {
+//		rf.CurrentTerm = args.Term
+//	}
+//
+//	data := args.Data
+//	if data == nil || len(data) < 1 {
+//		return
+//	}
+//	r := bytes.NewBuffer(data)
+//	d := labgob.NewDecoder(r)
+//	var log []LogEntries
+//	if d.Decode(&log) != nil {
+//		_, _ = DPrintf("InstallSnapshot -> Decode error\n")
+//	} else {
+//		// 现有日志条目与快照最后包含的条目具有相同的index和term
+//		if rf.Log[len(rf.Log)-1].LogID >= log[len(log)-1].LogID {
+//			rf.Log = rf.Log[len(log)-1:] // 包含快照的条目
+//			rf.persistL()
+//			rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), data)
+//
+//			reply.Term = rf.CurrentTerm
+//			applyMsg := applyMsg{
+//				CommandValid:  false,
+//				SnapshotValid: true,
+//				Snapshot:      data,
+//				SnapshotTerm:  rf.CurrentTerm,
+//				SnapshotIndex: log[len(log)-1].LogID,
+//			}
+//			rf.applyMsg <- applyMsg
+//			return
+//		} else {
+//
+//		}
+//	}
+//
+//	//// 此时如果follower日志落后，则不可直接创建快照
+//	//rf.persister.SaveStateAndSnapshot()
+//
+//	//rf.readPersist(rf.persister.ReadRaftState()) //重置为正常status
+//
 //}
 //
 //// example code to send a RequestVote RPC to a server.
@@ -439,12 +553,10 @@ package raft
 //// A false return can be caused by a dead server,
 //// a live server that can't be reached, a lost request, or a lost reply.
 //// 错误的返回可能是由于服务器失效、无法连接到活动服务器、请求丢失或回复丢失造成的。
-//
 //// Call() is guaranteed to return (perhaps after a delay) *except*
 //// if the handler function on the server side does not return.
 //// Thus there is no need to implement your own timeouts around Call().
 //// 除非服务器端的处理程序函数没有返回，否则Call()保证会返回（可能在延迟之后）。因此，没有必要在Call()周围实现您自己的超时。
-//
 //// look at the comments in ../labrpc/labrpc.go for more details.
 ////
 //// if you're having trouble getting RPC to work, check that
@@ -452,11 +564,18 @@ package raft
 //// and that the caller passes the address of the reply struct with &, not the struct itself.
 //// 如果您在使RPC工作时遇到问题，请检查您是否已将通过RPC传递的结构中的所有字段名大写，并且调用者是否使用&传递回复结构的地址，而不是结构本身。
 //// flag 为true时，胜选变为leader
-//func (rf *Raft) sendRequestVote(server int, votesCount *int, args *RequestVoteArgs, reply *RequestVoteReply, hadVoted *sync.Map) bool {
-//	// 如果已经成为leader了，直接返回
+//func (rf *Raft) sendRequestVote(server int, hadVote *sync.Map, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 //	if _, ok := rf.GetState(); ok {
 //		return false
 //	}
+//
+//	rf.mu.Lock()
+//	if rf.State == Follower {
+//		rf.mu.Unlock()
+//		return false
+//	}
+//	rf.mu.Unlock()
+//
 //	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 //	if !ok {
 //		//_, _ = DPrintf("server:%d to %d, sendRequestVote -> Call Raft.RequestVote error\n", rf.me, server)
@@ -465,56 +584,69 @@ package raft
 //
 //	rf.mu.Lock()
 //	defer rf.mu.Unlock()
-//	_, _ = DPrintf("server:%d, term:%d, commitIndex:%d\n", rf.me, rf.CurrentTerm, rf.CommitIndex)
+//	_, _ = DPrintf("server:%d, term:%d, commitIndex:%d 发送投票RPC\n", rf.me, rf.CurrentTerm, rf.CommitIndex)
 //	// 发出投票请求后，当前候选人的任期如果比follower任期大，则会更新follower任期
 //	if reply.VoteGranted {
 //		_, _ = DPrintf("server:%d 获取到server:%d的选票\n", rf.me, server)
-//		*votesCount++
-//		hadVoted.Store(server, 1)
+//		hadVote.Store(server, 1)
+//
+//		votesCount := 0
+//		for i := range rf.peers {
+//			val, _ := hadVote.Load(i)
+//			if val == 1 {
+//				votesCount++
+//			}
+//		}
+//
+//		// 胜选
+//		if votesCount > len(rf.peers)/2 && rf.CurrentTerm == args.Term && rf.State == Candidate { //后两条件貌似不可少
+//			rf.VotedFor = -1 // 胜选后向投票置为-1
+//			rf.NextIndex = make([]int, len(rf.peers))
+//			for i := range rf.NextIndex {
+//				// leader不可能覆盖自己的日志，所有应该初始化为最新日志的索引+1
+//				//rf.NextIndex[i] = len(rf.Log)
+//				rf.NextIndex[i] = rf.Log[len(rf.Log)-1].LogID + 1
+//			}
+//			rf.MatchIndex = make([]int, len(rf.peers))
+//
+//			rf.wg.Wait()
+//
+//			rf.ctx, rf.cancel = context.WithCancel(rf.parentCtx)
+//
+//			rf.State = Leader
+//
+//			_, _ = DPrintf("server:%d <- 胜选 ->，任期为: %d\n", rf.me, rf.CurrentTerm)
+//			_, _ = DPrintf("server:%d log:%v\n", rf.me, rf.Log)
+//			rf.persistL()
+//
+//			//发送心跳包
+//			go func() {
+//				// 这里胜选后立刻发送心跳;
+//				rf.wg.Add(1)
+//				defer rf.wg.Done()
+//				rf.sendHeartOrAppend()
+//				for {
+//					select {
+//					case <-time.After(100 * time.Millisecond):
+//						rf.sendHeartOrAppend()
+//					case <-rf.ctx.Done():
+//						_, _ = DPrintf("leader:%d 停止发送心跳包\n", rf.me)
+//						return
+//					}
+//					if rf.killed() == true {
+//						_, _ = DPrintf("leader:%d 宕机，停止发送心跳包\n", rf.me)
+//						return
+//					}
+//				}
+//			}()
+//		}
 //	} else {
+//		// 如果等于的话，重复发送的投票RPC会影响自己的状态
 //		if reply.Term > rf.CurrentTerm {
 //			rf.CurrentTerm = reply.Term
 //			rf.State = Follower
-//			rf.over <- 1
 //			rf.persistL()
 //		}
-//	}
-//
-//	// 胜选
-//	if *votesCount > len(rf.peers)/2 && rf.CurrentTerm == args.Term && rf.State == Candidate { //后两条件貌似不可少
-//		//rf.resetChan <- 1
-//		rf.over <- 1
-//		rf.VotedFor = -1 // 胜选后向投票置为-1
-//		rf.NextIndex = make([]int, len(rf.peers))
-//		for i := range rf.NextIndex {
-//			// leader不可能覆盖自己的日志，所有应该初始化为最新日志的索引+1
-//			rf.NextIndex[i] = len(rf.Log)
-//		}
-//		rf.MatchIndex = make([]int, len(rf.peers))
-//
-//		rf.State = Leader
-//
-//		_, _ = DPrintf("server:%d <- 胜选 ->，任期为: %d\n", rf.me, rf.CurrentTerm)
-//		_, _ = DPrintf("server:%d log:%v", rf.me, rf.Log)
-//		rf.persistL()
-//		//发送心跳包
-//		go func() {
-//			// 这里胜选后立刻发送心跳;
-//			rf.sendHeartOrAppend()
-//			for {
-//				select {
-//				case <-time.After(100 * time.Millisecond):
-//					rf.sendHeartOrAppend()
-//				case <-rf.ctx.Done():
-//					_, _ = DPrintf("leader:%d 转变身份,停止发送心跳包\n", rf.me)
-//					return
-//				}
-//				if rf.killed() == true {
-//					_, _ = DPrintf("leader:%d 宕机，停止发送心跳包\n", rf.me)
-//					break
-//				}
-//			}
-//		}()
 //	}
 //
 //	return false
@@ -535,19 +667,40 @@ package raft
 //			return true
 //		}
 //
+//		_, _ = DPrintf("server:%d log:%v\n", rf.me, rf.Log)
+//
 //		args := AppendEntriesArgs{
 //			Term:         rf.CurrentTerm,
 //			LeaderID:     rf.me,
-//			PrevLogIndex: rf.NextIndex[i] - 1,
-//			PrevLogTerm:  rf.Log[rf.NextIndex[i]-1].TermID,
 //			LeaderCommit: rf.CommitIndex,
 //		}
+//
+//		var atLastIndex int
+//		//if len(rf.Log) != 0 {
+//		//	args.PrevLogIndex = rf.Log[rf.NextIndex[i]-1-rf.LastIncludedIndex-1].LogID
+//		//	args.PrevLogTerm = rf.Log[rf.NextIndex[i]-1-rf.LastIncludedIndex-1].TermID
+//		//	atLastIndex = rf.Log[len(rf.Log)-1].LogID
+//		//} else {
+//		//	args.PrevLogIndex = rf.LastIncludedIndex
+//		//	args.PrevLogTerm = rf.LastIncludedTerm
+//		//	atLastIndex = rf.LastIncludedIndex
+//		//}
+//
+//		if rf.NextIndex[i]-1-rf.LastIncludedIndex-1 >= 0 {
+//			args.PrevLogIndex = rf.Log[rf.NextIndex[i]-1-rf.LastIncludedIndex-1].LogID
+//			args.PrevLogTerm = rf.Log[rf.NextIndex[i]-1-rf.LastIncludedIndex-1].TermID
+//			atLastIndex = rf.Log[len(rf.Log)-1].LogID
+//		} else {
+//			args.PrevLogIndex = rf.LastIncludedIndex
+//			args.PrevLogTerm = rf.LastIncludedTerm
+//			atLastIndex = rf.LastIncludedIndex
+//		}
+//
 //		reply := AppendEntriesReply{}
 //
-//		if args.PrevLogIndex < len(rf.Log)-1 {
-//			args.Entries = make([]LogEntries, len(rf.Log)-rf.NextIndex[i])
-//			copy(args.Entries, rf.Log[rf.NextIndex[i]:])
-//
+//		if args.PrevLogIndex < atLastIndex {
+//			args.Entries = make([]LogEntries, rf.Log[len(rf.Log)-1].LogID-rf.NextIndex[i]+1)
+//			copy(args.Entries, rf.Log[rf.NextIndex[i]-rf.LastIncludedIndex-1:])
 //			_, _ = DPrintf("Leader:%d 发现server:%d, 日志落后，现在可能需要日志:%d, 本身日志数量%d\n", rf.me, i, rf.NextIndex[i], len(rf.Log))
 //
 //			go rf.sendAppendEntries(i, &args, &reply)
@@ -573,7 +726,7 @@ package raft
 //
 //	// <-- 判断发送给follower的单个或者多个日志条目的append RPC是否返回ack -->
 //	// leader不能主动提交旧日志&& rf.CurrentTerm == args.Entries[len(args.Entries)-1].TermID
-//	if reply.Success && args.Entries != nil {
+//	if reply.Success && args.Entries != nil && args.Term == rf.CurrentTerm {
 //		rf.NextIndex[server] = args.Entries[len(args.Entries)-1].LogID + 1
 //		rf.MatchIndex[server] = args.Entries[len(args.Entries)-1].LogID
 //
@@ -581,10 +734,8 @@ package raft
 //
 //		// i代表当前需要判断是否达成大多数的一条日志条目
 //		// 这里应该是判断：直到 全部日志，还是仅判断： 直到follower返回的最新同步日志?
-//		//for i := rf.CommitIndex + 1; i < len(rf.Log); i++ {
 //		for i := rf.CommitIndex + 1; i < rf.NextIndex[server]; i++ {
-//			// leader不主动提交旧任期的日志条目
-//			if rf.Log[i].TermID != rf.CurrentTerm {
+//			if rf.Log[i-rf.LastIncludedIndex-1].TermID != rf.CurrentTerm {
 //				continue
 //			}
 //
@@ -602,7 +753,7 @@ package raft
 //				for j := rf.CommitIndex + 1; j <= i; j++ {
 //					applyMsg := applyMsg{
 //						CommandValid: true,
-//						Command:      rf.Log[j].Command,
+//						Command:      rf.Log[j-rf.LastIncludedIndex-1].Command,
 //						CommandIndex: j,
 //					}
 //					rf.applyMsg <- applyMsg
@@ -616,28 +767,33 @@ package raft
 //			}
 //		}
 //
+//		//if cnt > n/2 && rf.CommitIndex < rf.MatchIndex[server] {
+//		//
+//		//}
 //	}
+//
+//	// <-- 判断单个或者多个日志条目是否达成大多数 -->
+//	//if args.Entries != nil && args.Entries[len(args.Entries)-1].TermID == rf.CurrentTerm {
+//	//
+//	//}
 //
 //	// 返回false的处理
 //	// 此时返回的false可能是因为leader任期小于follower，或者follower日志不够新需要回退
-//	//if !reply.Success && reply.Term == rf.CurrentTerm && reply.HopeLogIndex != 0 {
-//	//	rf.NextIndex[server] = reply.HopeLogIndex // 回退日志
-//	//	_, _ = DPrintf("leader:%d 收到follower:%d 的回退日志请求，回退到:%d\n", rf.me, server, rf.NextIndex[server])
-//	//} else
-//	if !reply.Success && reply.Term == rf.CurrentTerm {
-//		if reply.ConflictTerm == 0 {
+//	if !reply.Success && reply.Term == rf.CurrentTerm && args.Term == rf.CurrentTerm {
+//		// 回退日志
+//		if reply.ConflictTerm == -1 {
 //			rf.NextIndex[server] = reply.ConflictFirstIndex
 //		} else {
 //			var i int
 //
-//			for i = args.PrevLogIndex; i > 0 && rf.Log[i].TermID >= reply.ConflictTerm; i-- {
-//				if rf.Log[i].TermID == reply.ConflictTerm {
+//			for i = args.PrevLogIndex; i > 0 && rf.Log[i-rf.LastIncludedIndex-1].TermID >= reply.ConflictTerm; i-- {
+//				if rf.Log[i-rf.LastIncludedIndex-1].TermID == reply.ConflictTerm {
 //					rf.NextIndex[server] = i + 1
 //					break
 //				}
 //			}
 //
-//			if rf.Log[i].TermID < reply.ConflictTerm {
+//			if rf.Log[i-rf.LastIncludedIndex-1].TermID < reply.ConflictTerm {
 //				rf.NextIndex[server] = reply.ConflictFirstIndex
 //			}
 //		}
@@ -654,6 +810,16 @@ package raft
 //		rf.persistL()
 //	}
 //	return true
+//}
+//
+//func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+//	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+//	if !ok {
+//		return
+//	}
+//
+//	rf.mu.Lock()
+//	defer rf.mu.Unlock()
 //}
 //
 //// Start the service using Raft (e.g. a k/v server) wants to start agreement on the next command to be appended to Raft's log.
@@ -678,7 +844,14 @@ package raft
 //
 //	rf.mu.Lock()
 //	defer rf.mu.Unlock()
-//	index := len(rf.Log) //注意此处是leader确定下一个需要被提交的日志的index
+//	var index int
+//	// 注意此处是leader确定下一个需要被提交的日志的index
+//	if len(rf.Log) != 0 {
+//		index = rf.Log[len(rf.Log)-1].LogID + 1
+//	} else {
+//		index = rf.LastIncludedIndex + 1
+//	}
+//
 //	// 这里没写重定向到leader
 //	if !isLeader {
 //		//_, _ = DPrintf("follower:%d return CommitIndex:%d\n", rf.me, rf.CommitIndex)
@@ -687,12 +860,12 @@ package raft
 //	}
 //
 //	entries := LogEntries{
-//		LogID:   len(rf.Log),
+//		LogID:   index,
 //		TermID:  rf.CurrentTerm,
 //		Command: command,
 //	}
 //
-//	_, _ = DPrintf("leader:%d 收到新日志:%d 追加请求\n", rf.me, len(rf.Log))
+//	_, _ = DPrintf("leader:%d 收到新日志:%d 追加请求\n", rf.me, index)
 //	rf.Log = append(rf.Log, entries)
 //	_, _ = DPrintf("leader:%d 日志:%v\n", rf.me, rf.Log)
 //	// 如果请求和心跳包两个是不同的发送appendRPC，那么请求有可能返回多次false，导致nextIndex不正常回退
@@ -738,7 +911,7 @@ package raft
 //	generator := rand.New(source)
 //
 //	// 生成一个介于 0 到 400 之间的随机数，加上 700，得到随机范围内的毫秒数
-//	randomMilliseconds := generator.Intn(500) + 300
+//	randomMilliseconds := generator.Intn(150) + 300
 //	// 将毫秒数转换为 Duration 类型
 //	duration := time.Duration(randomMilliseconds) * time.Millisecond
 //	return duration
@@ -784,41 +957,50 @@ package raft
 //		rf.State = Candidate
 //		rf.persistL()
 //		currentTerm := rf.CurrentTerm
-//		lastLogIndex := len(rf.Log) - 1
-//		lastLogTerm := rf.Log[len(rf.Log)-1].TermID
+//		var lastLogIndex int
+//		var lastLogTerm int
+//		if len(rf.Log) != 0 {
+//			lastLogIndex = rf.Log[len(rf.Log)-1].LogID
+//			lastLogTerm = rf.Log[len(rf.Log)-1].TermID
+//		} else {
+//			lastLogIndex = rf.LastIncludedIndex
+//			lastLogTerm = rf.LastIncludedTerm
+//		}
 //		rf.mu.Unlock()
 //
-//		//一次投票多次发起投票RPC
-//		VotesCount := 1
-//		//hadVoted := make(, len(rf.peers))
-//		var hadVoted sync.Map
-//		go func(currentTerm, lastLogIndex, lastLogTerm, VotesCount int, hadVoted *sync.Map) {
+//		var hadVote sync.Map
+//		hadVote.Store(rf.me, 1)
+//
+//		// 胜选、身份转变、选举超时，后终止该goroutine
+//		go func() {
 //			for {
-//				select {
-//				case <-time.After(100 * time.Millisecond):
-//					for i := range len(rf.peers) {
-//						val, _ := hadVoted.Load(i)
-//						if i == rf.me || val == 1 {
-//							continue
-//						}
-//
-//						args := RequestVoteArgs{
-//							Term:         currentTerm,
-//							CandidateID:  rf.me,
-//							LastLogIndex: lastLogIndex,
-//							LastLogTerm:  lastLogTerm,
-//						}
-//						reply := RequestVoteReply{}
-//						//_, _ = DPrintf("server:%d send voteRPC to %d\n", rf.me, i)
-//						go rf.sendRequestVote(i, &VotesCount, &args, &reply, hadVoted)
+//				for i := range len(rf.peers) {
+//					val, _ := hadVote.Load(i)
+//					if i == rf.me || val == 1 {
+//						continue
 //					}
-//					rf.over <- 1
-//				case <-rf.over: // 胜选后,或者投票收到对方任期大于自己,信号发给over，结束投票
-//					break
-//				}
 //
+//					args := RequestVoteArgs{
+//						Term:         currentTerm,
+//						CandidateID:  rf.me,
+//						LastLogIndex: lastLogIndex,
+//						LastLogTerm:  lastLogTerm,
+//					}
+//					reply := RequestVoteReply{}
+//
+//					//_, _ = DPrintf("server:%d send voteRPC to %d\n", rf.me, i)
+//					go rf.sendRequestVote(i, &hadVote, &args, &reply)
+//				}
+//				if ct, ok := rf.GetState(); ok || ct != currentTerm || rf.killed() == true {
+//					return
+//				} else {
+//					time.Sleep(100 * time.Millisecond)
+//					if ct, ok = rf.GetState(); ok || ct != currentTerm || rf.killed() == true {
+//						return
+//					}
+//				}
 //			}
-//		}(currentTerm, lastLogIndex, lastLogTerm, VotesCount, &hadVoted)
+//		}()
 //
 //	}
 //}
@@ -862,9 +1044,11 @@ package raft
 //
 //	rf.State = Follower
 //	rf.resetChan = make(chan int, 100)
-//	rf.over = make(chan int, 5)
 //
-//	rf.ctx, rf.cancel = context.WithCancel(context.Background())
+//	rf.parentCtx = context.Background()
+//	rf.ctx, rf.cancel = context.WithCancel(rf.parentCtx)
+//
+//	rf.LastIncludedIndex = -1 //防止-1索引
 //
 //	// initialize from state persisted before a crash
 //	// 从崩溃前保持的状态初始化
