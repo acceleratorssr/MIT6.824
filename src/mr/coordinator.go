@@ -78,6 +78,7 @@ func (c *Coordinator) GetWork(args *TaskArgs, reply *TaskReply) error {
 				fmt.Println("GoToReducePhase error")
 				return nil
 			}
+			close(c.TaskMapChannel)
 		} else if c.TaskPhase == TaskReduce {
 			c.AllDone = true
 			reply.AllDone = true
@@ -94,6 +95,7 @@ func (c *Coordinator) GetWork(args *TaskArgs, reply *TaskReply) error {
 					fmt.Printf("删除文件 %s 时出错: %v\n", file, err)
 				}
 			}
+			close(c.TaskReduceChannel)
 		}
 	}
 	return nil

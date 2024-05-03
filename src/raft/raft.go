@@ -123,6 +123,9 @@ type Raft struct {
 
 	LastIncludedTerm  int //LastIncludedIndex所处的任期号
 	LastIncludedIndex int //最后一个被快照取代的日志条目的索引值
+
+	applySnapshot bool
+	applyLog      bool
 }
 
 // GetState return currentTerm，以及此服务器是否认为自己是leader。
@@ -145,6 +148,7 @@ func (rf *Raft) persistL() {
 	e.Encode(rf.VotedFor)
 	e.Encode(rf.Log)
 	e.Encode(rf.LastIncludedTerm)
+	e.Encode(rf.LastIncludedIndex)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 	_, _ = DPrintf("持久化状态成功\n")
@@ -163,24 +167,31 @@ func (rf *Raft) readPersist(data []byte) {
 	var voteFor int
 	var log []LogEntries
 	var lastIncludedTerm int
+	var lastIncludedIndex int
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&voteFor) != nil ||
 		d.Decode(&log) != nil ||
-		d.Decode(&lastIncludedTerm) != nil {
+		d.Decode(&lastIncludedTerm) != nil ||
+		d.Decode(&lastIncludedIndex) != nil {
 		_, _ = DPrintf("readPersist -> Decode error\n")
 	} else {
 		rf.CurrentTerm = currentTerm
 		rf.VotedFor = voteFor
 		rf.Log = log
 		rf.LastIncludedTerm = lastIncludedTerm
-		_, _ = DPrintf("server:%d 恢复状态为: currentTerm: %d, voteFor: %d log: %v\n",
-			rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log)
+		rf.LastIncludedIndex = lastIncludedIndex
+		_, _ = DPrintf("server:%d 恢复状态为: currentTerm: %d, voteFor: %d ,LastIncludedTerm:%d ,log: %v\n",
+			rf.me, rf.CurrentTerm, rf.VotedFor, rf.LastIncludedTerm, rf.Log)
 	}
 	//if rf.State == Leader {
 	//	_, _ = DPrintf("server:%d 重启后状态变回follower\n", rf.me)
 	//	rf.cancel()
 	//	rf.State = Follower
 	//}
+
+	// 如果有快照了，则commitindex一定不会小于lastindex
+	rf.CommitIndex = max(rf.LastIncludedIndex, 0)
+	_, _ = DPrintf("server:%d commitIndex恢复为:%d\n", rf.me, rf.CommitIndex)
 }
 
 // CondInstallSnapshot 服务希望切换到快照。只有当Raft在applyCh上传递快照后没有更新的信息时才这样做。
@@ -208,6 +219,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	e.Encode(rf.VotedFor)
 	e.Encode(rf.Log)
 	e.Encode(rf.LastIncludedTerm)
+	e.Encode(rf.LastIncludedIndex)
 	dataState := w.Bytes()
 
 	//w = new(bytes.Buffer)
@@ -263,6 +275,7 @@ type AppendEntriesReply struct {
 	Success            bool // 如果日志条目顺序匹配，则返回true
 	ConflictTerm       int  //冲突的term
 	ConflictFirstIndex int  //该term的第一个日志的index值
+	NeedSnapshot       bool
 }
 
 func (rf *Raft) GetLatestLogIndexAndTerm() (int, int) {
@@ -397,11 +410,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	var term int //PrevLogIndex在当前log内的对应日志的任期号
+	var index int
 
-	if args.PrevLogIndex != rf.LastIncludedIndex {
-		term = rf.Log[args.PrevLogIndex-rf.LastIncludedIndex-1].TermID
-	} else {
+	// 此时的前一日志的匹配只能通过pre进行，因为真实日志已经被压缩到快照内了
+	if args.PrevLogIndex == rf.LastIncludedIndex {
 		term = rf.LastIncludedTerm
+		index = rf.LastIncludedIndex
+		_, _ = DPrintf("args.PrevLogIndex == rf.LastIncludedIndex\n")
+	} else {
+		term = rf.Log[args.PrevLogIndex-rf.LastIncludedIndex-1].TermID
+		index = rf.Log[0].LogID
 	}
 
 	// <-- 处理日志期望对应的任期不匹配的问题 -->
@@ -415,8 +433,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 
 		reply.ConflictTerm = term
+
+		////此时pre的任期不匹配，感觉不会有这种情况？
+		//if index == latestLogIndex {
+		//	reply.NeedSnapshot = true
+		//	_, _ = DPrintf("follower:%d 期望日志索引:%d\n", rf.me, reply.ConflictFirstIndex)
+		//	_, _ = DPrintf("follower:%d 日志:%v\n", rf.me, rf.Log)
+		//	return
+		//}
+
 		if len(rf.Log) != 0 {
-			for i := rf.Log[0].LogID; i <= args.PrevLogIndex; i++ {
+			//for i := rf.Log[0].LogID; i <= args.PrevLogIndex; i++ {
+			for i := index; i <= args.PrevLogIndex; i++ {
 				if rf.Log[i-rf.LastIncludedIndex-1].TermID == reply.ConflictTerm {
 					reply.ConflictFirstIndex = i
 					break
@@ -490,6 +518,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	args.LeaderCommit = min(args.LeaderCommit, latestLogIndex)
 	if args.LeaderCommit > rf.CommitIndex {
 		_, _ = DPrintf("follower:%d 更新最新的提交日志索引: %d\n", rf.me, args.LeaderCommit)
+		// commitindex因为重启会失效
 		for i := rf.CommitIndex + 1; i <= args.LeaderCommit; i++ {
 			applyMsg := ApplyMsg{
 				CommandValid: true,
@@ -523,18 +552,32 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	} else if args.Term > rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
 		reply.Term = rf.CurrentTerm
+		if rf.State == Leader {
+			rf.State = Follower
+			rf.cancel()
+			_, _ = DPrintf("旧leader:%d 转变为follower\n", rf.me)
+		}
 	}
 
+	// 相同的快照直接返回
+	if args.LastIncludedIndex == rf.LastIncludedIndex {
+		reply.Term = rf.CurrentTerm
+		return
+	}
+
+	// 如果当前日志index长度大于快照index长度，则日志从快照的lastindex开始截断
 	if latestLogIndex >= args.LastIncludedIndex {
 		sLogs := make([]LogEntries, 0)
-		rf.Log = append(sLogs, rf.Log[latestLogIndex-args.LastIncludedIndex:]...) // 包含快照的条目
+		//rf.Log = append(sLogs, rf.Log[latestLogIndex-args.LastIncludedIndex:]...) // 包含快照的条目
+		rf.Log = append(sLogs, rf.Log[args.LastIncludedIndex-rf.LastIncludedIndex-1:]...) // 包含快照的条目
 	} else {
 		rf.Log = nil
 	}
 
 	rf.LastIncludedIndex = args.LastIncludedIndex
-	rf.LastIncludedTerm = args.Term
-	rf.CommitIndex = args.LastIncludedIndex
+	//rf.LastIncludedTerm = args.Term
+	rf.LastIncludedTerm = args.LastIncludedTerm //应该是日志的任期，而不是节点的任期
+	rf.CommitIndex = args.LastIncludedIndex     // 这里需要apply吗
 	rf.LastApplied = rf.CommitIndex
 
 	w := new(bytes.Buffer)
@@ -859,6 +902,20 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	// 返回false的处理
 	// 此时返回的false可能是因为leader任期小于follower，或者follower日志不够新需要回退
 	if !reply.Success && reply.Term == rf.CurrentTerm && args.Term == rf.CurrentTerm {
+		if reply.NeedSnapshot {
+			argsSnapshot := InstallSnapshotArgs{
+				Term:              rf.CurrentTerm,
+				LeaderId:          rf.me,
+				LastIncludedIndex: rf.LastIncludedIndex,
+				LastIncludedTerm:  rf.LastIncludedTerm,
+				Data:              rf.persister.ReadSnapshot(),
+			}
+			replySnapshot := InstallSnapshotReply{}
+			_, _ = DPrintf("leader:%d follower%d当PrevLogIndex & lastincludeindex不匹配时\n", rf.me, server)
+			go rf.sendInstallSnapshot(server, &argsSnapshot, &replySnapshot)
+			return false
+		}
+
 		// 回退日志
 		if reply.ConflictTerm == -1 {
 			// 这里的 ConflictFirstIndex 应该是follower已经拥有的最后一个日志的index
@@ -866,6 +923,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		} else {
 			var i int
 
+			// 找冲突任期的第一个日志
 			for i = args.PrevLogIndex; i > 0 && rf.Log[i-rf.LastIncludedIndex-1].TermID >= reply.ConflictTerm; i-- {
 				if rf.Log[i-rf.LastIncludedIndex-1].TermID == reply.ConflictTerm {
 					rf.NextIndex[server] = i + 1
@@ -1123,7 +1181,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.MatchIndex = make([]int, len(rf.peers))
 
-	rf.readyApplyMsg = make(chan ApplyMsg, 500) //开10个貌似太少了
+	rf.readyApplyMsg = make(chan ApplyMsg, 1000) //开10个貌似太少了
 	rf.cond = sync.NewCond(&rf.mu)
 	rf.applyMsg = applyCh
 
@@ -1133,7 +1191,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.parentCtx = context.Background()
 	rf.ctx, rf.cancel = context.WithCancel(rf.parentCtx)
 
-	//rf.LastIncludedIndex = -1
+	rf.LastIncludedIndex = -1
 
 	// initialize from state persisted before a crash
 	// 从崩溃前保持的状态初始化
@@ -1142,7 +1200,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//if rf.Log[0].LogID != 0 {
 	//	rf.LastIncludedIndex = rf.Log[0].LogID - 1
 	//}
-	rf.LastIncludedIndex = rf.Log[0].LogID - 1
 
 	// start ticker goroutine to start elections
 	// 启动ticker goroutine启动选举
