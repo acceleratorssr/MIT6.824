@@ -1,6 +1,6 @@
 #!/bin/bash
 
-max_attempts=20
+max_attempts=10
 attempts=0
 success_count=0
 
@@ -11,7 +11,7 @@ while true; do
 
     start_time=$(date +%s%N)
 
-    if go test -run TestSnapshotInstall2D -race; then
+    if go test -run TestSnapshotAllCrash2D -race; then
         ((success_count++))
 #        end_time=$(date +%s%N) # 记录结束时间（纳秒）
 #        duration=$((end_time - start_time)) # 计算测试运行时间（纳秒）

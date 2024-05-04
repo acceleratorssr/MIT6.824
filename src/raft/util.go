@@ -24,8 +24,8 @@ func init() {
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
-		debugLog.Printf(format, a...)
-		//log.Printf(format, a...)
+		//debugLog.Printf(format, a...)
+		log.Printf(format, a...)
 	}
 	return
 }

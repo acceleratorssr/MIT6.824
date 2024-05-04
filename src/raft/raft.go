@@ -191,6 +191,7 @@ func (rf *Raft) readPersist(data []byte) {
 
 	// 如果有快照了，则commitindex一定不会小于lastindex
 	rf.CommitIndex = max(rf.LastIncludedIndex, 0)
+	rf.LastApplied = rf.CommitIndex
 	_, _ = DPrintf("server:%d commitIndex恢复为:%d\n", rf.me, rf.CommitIndex)
 }
 
@@ -519,19 +520,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.CommitIndex {
 		_, _ = DPrintf("follower:%d 更新最新的提交日志索引: %d\n", rf.me, args.LeaderCommit)
 		// commitindex因为重启会失效
-		for i := rf.CommitIndex + 1; i <= args.LeaderCommit; i++ {
-			applyMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.Log[i-rf.LastIncludedIndex-1].Command,
-				CommandIndex: i,
-			}
-			//rf.applyMsg <- applyMsg // 小心阻塞
-			rf.readyApplyMsg <- applyMsg
-			rf.cond.Broadcast()
-		}
+		//for i := rf.CommitIndex + 1; i <= args.LeaderCommit; i++ {
+		//	//applyMsg := ApplyMsg{
+		//	//	CommandValid: true,
+		//	//	Command:      rf.Log[i-rf.LastIncludedIndex-1].Command,
+		//	//	CommandIndex: i,
+		//	//}
+		//	//rf.readyApplyMsg <- applyMsg
+		//	rf.cond.Broadcast()
+		//}
 		_, _ = DPrintf("follower:%d 日志: %v\n", rf.me, rf.Log)
 		rf.CommitIndex = args.LeaderCommit
-		rf.LastApplied = rf.CommitIndex // 暂时直接提交及应用
+		rf.cond.Broadcast()
+		//rf.LastApplied = rf.CommitIndex // 暂时直接提交及应用
 
 		reply.Term = rf.CurrentTerm
 		reply.Success = true
@@ -548,6 +549,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
+		_, _ = DPrintf("server:%d args.Term < rf.CurrentTerm\n", rf.me)
 		return
 	} else if args.Term > rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
@@ -562,14 +564,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// 相同的快照直接返回
 	if args.LastIncludedIndex == rf.LastIncludedIndex {
 		reply.Term = rf.CurrentTerm
+		_, _ = DPrintf("server:%d 接收到相同的快照,故直接返回\n", rf.me)
 		return
 	}
 
 	// 如果当前日志index长度大于快照index长度，则日志从快照的lastindex开始截断
 	if latestLogIndex >= args.LastIncludedIndex {
 		sLogs := make([]LogEntries, 0)
-		//rf.Log = append(sLogs, rf.Log[latestLogIndex-args.LastIncludedIndex:]...) // 包含快照的条目
-		rf.Log = append(sLogs, rf.Log[args.LastIncludedIndex-rf.LastIncludedIndex-1:]...) // 包含快照的条目
+		// 不能保留LastIncludedIndex位置的日志
+		rf.Log = append(sLogs, rf.Log[args.LastIncludedIndex+1-rf.LastIncludedIndex-1:]...) // 包含快照的条目
 	} else {
 		rf.Log = nil
 	}
@@ -594,12 +597,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		CommandValid:  false,
 		SnapshotValid: true,
 		Snapshot:      args.Data,
-		SnapshotTerm:  rf.CurrentTerm,
-		SnapshotIndex: args.LastIncludedIndex,
+		SnapshotTerm:  rf.LastIncludedTerm,
+		SnapshotIndex: rf.LastIncludedIndex,
 	}
-	//rf.applyMsg <- applyMsg
 	rf.readyApplyMsg <- applyMsg
-
+	rf.applySnapshot = true
 	rf.cond.Broadcast()
 	_, _ = DPrintf("server:%d 成功储存快照及状态\n", rf.me)
 	//// 此时如果follower日志落后，则不可直接创建快照
@@ -614,23 +616,55 @@ func (rf *Raft) apply() {
 	defer rf.mu.Unlock()
 
 	for !rf.killed() {
-		for len(rf.readyApplyMsg) != 0 {
-			msg := <-rf.readyApplyMsg
-			rf.LastApplied = msg.CommandIndex
-			rf.mu.Unlock()
-			rf.applyMsg <- msg
-			rf.mu.Lock()
-		}
-		rf.cond.Wait()
-		//if rf.LastApplied < rf.CommitIndex {
-		//	rf.LastApplied++
-		//	applyMsg := ApplyMsg{
-		//		CommandValid: true,
-		//		Command:      rf.Log[rf.LastApplied-rf.Log[0].LogID].Command,
-		//		CommandIndex: rf.LastApplied,
-		//	}
-		//	rf.applyMsg <- applyMsg
+		//for len(rf.readyApplyMsg) != 0 {
+		//	msg := <-rf.readyApplyMsg
+		//	rf.LastApplied = msg.CommandIndex
+		//	rf.mu.Unlock()
+		//	rf.applyMsg <- msg
+		//	rf.mu.Lock()
 		//}
+		//rf.cond.Wait()
+		if rf.LastApplied < rf.CommitIndex {
+			//for rf.LastApplied < rf.CommitIndex {
+			rf.LastApplied++
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.Log[rf.LastApplied-rf.LastIncludedIndex-1].Command,
+				CommandIndex: rf.LastApplied,
+			}
+			_, _ = DPrintf("server:%d applyMsg: Command:%v,CommandIndex:%d\n", rf.me, applyMsg.Command, applyMsg.CommandIndex)
+			rf.mu.Unlock()
+			rf.applyMsg <- applyMsg
+			rf.mu.Lock()
+			//}
+		} else if rf.applySnapshot {
+			rf.applySnapshot = false
+			for len(rf.readyApplyMsg) != 0 {
+				msg := <-rf.readyApplyMsg
+				//rf.CommitIndex = msg.CommandIndex
+				//rf.LastApplied = msg.CommandIndex
+				rf.mu.Unlock()
+				rf.applyMsg <- msg
+				rf.mu.Lock()
+			}
+			_, _ = DPrintf("server:%d 成功apply快照:%d\n", rf.me, rf.LastApplied)
+
+			//// snapshot decode error
+			////// 应该是指最后一个日志的任期和index吧
+			//data := rf.persister.ReadSnapshot()
+			//applyMsg := ApplyMsg{
+			//	CommandValid:  false,
+			//	SnapshotValid: true,
+			//	Snapshot:      data,
+			//	SnapshotTerm:  rf.LastIncludedTerm,
+			//	SnapshotIndex: rf.LastIncludedIndex,
+			//}
+			//rf.mu.Unlock()
+			//rf.applyMsg <- applyMsg
+			//rf.mu.Lock()
+		} else {
+			rf.cond.Wait()
+		}
 	}
 }
 
@@ -880,20 +914,20 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				}
 			}
 			if cnt > n/2 {
-				for j := rf.CommitIndex + 1; j <= i; j++ {
-					applyMsg := ApplyMsg{
-						CommandValid: true,
-						Command:      rf.Log[j-rf.LastIncludedIndex-1].Command,
-						CommandIndex: j,
-					}
-					//rf.applyMsg <- applyMsg
-					rf.readyApplyMsg <- applyMsg
-					rf.cond.Broadcast()
-				}
+				//for j := rf.CommitIndex + 1; j <= i; j++ {
+				//	//applyMsg := ApplyMsg{
+				//	//	CommandValid: true,
+				//	//	Command:      rf.Log[j-rf.LastIncludedIndex-1].Command,
+				//	//	CommandIndex: j,
+				//	//}
+				//	//rf.readyApplyMsg <- applyMsg
+				//	rf.cond.Broadcast()
+				//}
 				rf.CommitIndex = i
+				rf.cond.Broadcast()
 				_, _ = DPrintf("leader:%d 更新被提交的最高日志条目的索引为:%d\n", rf.me, rf.CommitIndex)
 
-				rf.LastApplied = rf.CommitIndex // 暂时直接提交=应用
+				//rf.LastApplied = rf.CommitIndex // 暂时直接提交=应用
 				_, _ = DPrintf("leader:%d 日志:%v", rf.me, rf.Log)
 			}
 		}
