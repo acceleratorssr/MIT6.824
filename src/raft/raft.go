@@ -274,9 +274,6 @@ func (rf *Raft) GetLatestLogIndexAndTerm() (int, int) {
 // 如果VotedFor是nil/candidateID，且候选人日志至少和接收人的日志一样新，则投票
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	// 请求投票RPC也会刷新计时，之前忘了加
-	rf.resetChan <- 1 // 通知ticker重新初始化
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -328,6 +325,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.VotedFor = args.CandidateID
 	rf.CurrentTerm = args.Term // 更新follower的任期为候选人的任期
 
+	// 请求投票RPC也会刷新计时，之前忘了加
+	rf.resetChan <- 1 // 通知ticker重新初始化
 	if rf.State == Candidate {
 		rf.State = Follower
 	}
