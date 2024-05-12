@@ -15,7 +15,7 @@ var (
 )
 
 func init() {
-	file, err := os.Create("debug.log")
+	file, err := os.Create("debug_raft.log")
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}

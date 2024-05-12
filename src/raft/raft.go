@@ -499,7 +499,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		_, _ = DPrintf("follower:%d 收到 %d 的心跳, 本节点任期: %d, leader任期: %d\n", rf.me, args.LeaderID, rf.CurrentTerm, args.Term)
 		reply.Term = rf.CurrentTerm
 		reply.Success = true
-		rf.persistL()
+		//rf.persistL()
 	} else {
 		for i := cnt; i < len(args.Entries); i++ {
 			rf.Log = append(rf.Log, args.Entries[i])
