@@ -7,8 +7,9 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	ID         int
 	LastLeader int
-	LastTaskID int64
+	LastTaskID int
 }
 
 func nrand() int64 {
@@ -22,6 +23,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.ID = int(nrand())
 	ck.LastLeader = 0
 	ck.LastTaskID = 1
 	return ck
@@ -40,19 +42,20 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{
-		ID:  ck.LastTaskID,
-		Key: key,
+		TaskID:   ck.LastTaskID,
+		ClientID: ck.ID,
+		Key:      key,
 	}
 	reply := GetReply{}
-	ck.LastTaskID++
 
 	for i := ck.LastLeader; i <= len(ck.servers); i++ {
 		i %= len(ck.servers)
-		_, _ = DPrintf("client send GET, ID:%v key:%v \n", args.ID, key)
+		_, _ = DPrintf("client send GET, TaskID:%v key:%v \n", args.TaskID, key)
 		ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
 		if ok && reply.Err == "" {
 			_, _ = DPrintf("KVServer Get: %v\n", reply.Value)
 			ck.LastLeader = i
+			ck.LastTaskID++
 
 			return reply.Value
 		} else {
@@ -81,22 +84,23 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	switch op {
 	case "Put":
 		args := PutAppendArgs{
-			ID:    ck.LastTaskID,
-			Key:   key,
-			Value: value,
-			Op:    "Put",
+			TaskID:   ck.LastTaskID,
+			ClientID: ck.ID,
+			Key:      key,
+			Value:    value,
+			Op:       "Put",
 		}
 		reply := PutAppendReply{}
-		ck.LastTaskID++
 
 		for i := ck.LastLeader; i <= len(ck.servers); i++ {
 			i %= len(ck.servers)
-			_, _ = DPrintf("client send PUT, ID:%v key:%v value%v \n", args.ID, key, value)
+			_, _ = DPrintf("client send PUT, TaskID:%v key:%v value%v \n", args.TaskID, key, value)
 			ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
 			if ok && reply.Err == "" {
 				_, _ = DPrintf("KVServer Put successful\n")
 				ck.LastLeader = i
 				_, _ = DPrintf("client 记录leader为:%d \n", ck.LastLeader)
+				ck.LastTaskID++
 
 				return
 			} else {
@@ -109,17 +113,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 	case "Append":
 		args := PutAppendArgs{
-			ID:    ck.LastTaskID,
-			Key:   key,
-			Value: value,
-			Op:    "Append",
+			TaskID:   ck.LastTaskID,
+			ClientID: ck.ID,
+			Key:      key,
+			Value:    value,
+			Op:       "Append",
 		}
 		reply := PutAppendReply{}
 		ck.LastTaskID++
 
 		for i := ck.LastLeader; i <= len(ck.servers); i++ {
 			i %= len(ck.servers)
-			_, _ = DPrintf("client send APPEND, ID:%v key:%v value%v \n", args.ID, key, value)
+			_, _ = DPrintf("client send APPEND, TaskID:%v key:%v value%v \n", args.TaskID, key, value)
 			ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
 			if ok && reply.Err == "" {
 				_, _ = DPrintf("KVServer Put successful\n")

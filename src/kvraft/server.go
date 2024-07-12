@@ -38,9 +38,11 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	ID    int64
-	Key   string
-	Value string
+	TaskID   int
+	ClientID int
+	Key      string
+	Value    string
+	Op       string // "Put" or "Append" or "Get"
 }
 
 type KVServer struct {
@@ -53,127 +55,155 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kv         map[string]string
-	LastTaskID int64
-	done       map[int64]bool
+	kv           map[string]string
+	LastTaskID   map[int]int
+	applyChan    map[int]chan Op
+	lastCommitID int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 
 	// 如果是leader才执行get请求
-	if _, ok := kv.rf.GetState(); ok {
-		_, _ = DPrintf("server:%d 是leader (GET) \n", kv.me)
+	//_, _ = DPrintf("server:%d 是leader (GET) \n", kv.me)
 
-		//// 判重
-		//if kv.done[args.ID] {
-		//	reply.Err = "此请求已经被处理过了"
-		//	return
-		//}
-
-		logValue := Op{
-			ID:    args.ID,
-			Key:   args.Key,
-			Value: kv.kv[args.Key],
-		}
-		kv.rf.Start(logValue)
-
-		select {
-		case msg := <-kv.applyCh:
-			// 正常返回
-			if msg.CommandValid && msg.Command == logValue {
-				_, _ = DPrintf("server:%d [%s]%s \n", kv.me, args.Key, kv.kv[args.Key])
-				reply.Value = kv.kv[args.Key]
-				//kv.done[args.ID] = true
-				return
-			} else {
-				_, _ = DPrintf("server:%d commond error:%v \n", kv.me, msg.Command)
-				reply.Err = Err(fmt.Sprintf("server:%d commond error:%v \n", kv.me, msg.Command))
-			}
-		case <-time.After(1 * time.Second): //可能是leader过时了
-			_, _ = DPrintf("server:%d 超时\n", kv.me)
-			reply.Err = Err(fmt.Sprintf("server:%d outtime \n", kv.me))
-		}
-
-		//if kv.kv[args.Key] == "" {
-		//	_, _ = DPrintf("server:%d 不存在该key \n", kv.me)
-		//	reply.Err = "不存在该key"
-		//	return
-		//} else {
-		//	reply.Value = kv.kv[args.Key]
-		//	_, _ = DPrintf("server:%d [%s]%s \n", kv.me, args.Key, kv.kv[args.Key])
-		//	return
-		//}
-	} else {
-		reply.Err = Err(fmt.Sprintf("server:%d 不是leader (Get) \n", kv.me))
+	logValue := Op{
+		TaskID:   args.TaskID,
+		ClientID: args.ClientID,
+		Key:      args.Key,
+		Value:    kv.kv[args.Key],
+		Op:       "Get",
 	}
+
+	index, _, is := kv.rf.Start(logValue)
+
+	if !is {
+		reply.Err = Err(fmt.Sprintf("server:%d 不是leader (Get) \n", kv.me))
+		return
+	}
+
+	kv.mu.Lock()
+	ch := kv.GetApplyChanForCommitID(index)
+	kv.mu.Unlock()
+
+	select {
+	case msg := <-ch:
+		// 正常返回
+		if msg.TaskID == logValue.TaskID && msg.ClientID == logValue.ClientID {
+			_, _ = DPrintf("server:%d [%s]%s \n", kv.me, args.Key, kv.kv[args.Key])
+			reply.Value = msg.Value
+			return
+		} else {
+			_, _ = DPrintf("server:%d commond error:%v \n", kv.me, msg)
+			reply.Err = Err(fmt.Sprintf("server:%d commond error:%v \n", kv.me, msg))
+		}
+	case <-time.After(1 * time.Second): //可能是leader过时了
+		_, _ = DPrintf("server:%d 超时\n", kv.me)
+		reply.Err = Err(fmt.Sprintf("server:%d outtime \n", kv.me))
+	}
+
+	go func() {
+		kv.mu.Lock()
+		delete(kv.applyChan, index)
+		kv.mu.Unlock()
+	}()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 
 	// 如果是leader才执行PutAppend请求
-	if _, ok := kv.rf.GetState(); ok {
-		_, _ = DPrintf("server:%d 是leader (PutAppend) \n", kv.me)
 
-		//// 判重
-		//if kv.done[args.ID] {
-		//	reply.Err = "此请求已经被处理过了"
-		//	return
-		//}
+	//_, _ = DPrintf("server:%d 是leader (PutAppend) \n", kv.me)
 
-		logValue := Op{
-			ID:    args.ID,
-			Key:   args.Key,
-			Value: args.Value,
-		}
-
-		if args.Op == "Append" {
-			logValue.Value = kv.kv[args.Key] + args.Value
-		}
-
-		_, _ = DPrintf("server:%d need new log:%v \n", kv.me, logValue)
-		kv.rf.Start(logValue)
-		//for len(kv.rf.applyMsg) != 0 {
-		select {
-		case msg := <-kv.applyCh:
-			if msg.CommandValid && msg.Command == logValue {
-				//if kv.kv[args.Key] == "" {
-				//	kv.kv[args.Key] = args.Value
-				//} else {
-				//	kv.kv[args.Key] = kv.kv[args.Key] + args.Value
-				//}
-				kv.kv[args.Key] = logValue.Value
-
-				_, _ = DPrintf("raft日志达成大多数\n")
-				_, _ = DPrintf("server:%d [%s]%s \n", kv.me, args.Key, kv.kv[args.Key])
-				kv.done[args.ID] = true
-				//kv.LastTaskID = args.ID
-				reply.Err = ""
-				return
-			} else {
-				_, _ = DPrintf("server:%d commond error:%v \n", kv.me, msg.Command)
-				reply.Err = Err(fmt.Sprintf("server:%d commond error:%v \n", kv.me, msg.Command))
-			}
-		case <-time.After(1 * time.Second):
-			_, _ = DPrintf("server:%d 超时\n", kv.me)
-			reply.Err = Err(fmt.Sprintf("server:%d outtime \n", kv.me))
-		}
-		//}
-	} else {
-		reply.Err = Err(fmt.Sprintf("server:%d 不是leader (PutAppend) \n", kv.me))
+	logValue := Op{
+		TaskID:   args.TaskID,
+		ClientID: args.ClientID,
+		Key:      args.Key,
+		Value:    args.Value,
+		Op:       args.Op,
 	}
+
+	//if args.Op == "Append" {
+	//	logValue.Value = kv.kv[args.Key] + args.Value
+	//}
+
+	_, _ = DPrintf("server:%d need new log:%v \n", kv.me, logValue)
+	index, _, is := kv.rf.Start(logValue)
+
+	if !is {
+		reply.Err = Err(fmt.Sprintf("server:%d 不是leader (PutAppend) \n", kv.me))
+		return
+	}
+
+	kv.mu.Lock()
+	ch := kv.GetApplyChanForCommitID(index)
+	kv.mu.Unlock()
+
+	select {
+	case msg := <-ch:
+		if msg.TaskID == logValue.TaskID && msg.ClientID == logValue.ClientID {
+			_, _ = DPrintf("raft日志达成大多数\n")
+			_, _ = DPrintf("server:%d [%s]%s \n", kv.me, args.Key, kv.kv[args.Key])
+			reply.Err = ""
+			return
+		} else {
+			_, _ = DPrintf("server:%d commond error:%v \n", kv.me, msg)
+			reply.Err = Err(fmt.Sprintf("server:%d commond error:%v \n", kv.me, msg))
+		}
+	case <-time.After(1 * time.Second):
+		_, _ = DPrintf("server:%d 超时\n", kv.me)
+		reply.Err = Err(fmt.Sprintf("server:%d outOfTime \n", kv.me))
+	}
+
+	go func() {
+		kv.mu.Lock()
+		delete(kv.applyChan, index)
+		kv.mu.Unlock()
+	}()
 }
 
 func (kv *KVServer) apply() {
 	for !kv.killed() {
-		msg := <-kv.applyCh
-		if msg.CommandValid {
+		select {
+		case msg := <-kv.applyCh:
+			if msg.CommandValid {
+				kv.mu.Lock()
+				if msg.CommandIndex <= kv.lastCommitID {
+					kv.mu.Unlock()
+					continue
+				}
 
+				kv.lastCommitID = msg.CommandIndex
+				command := msg.Command.(Op)
+				_, _ = DPrintf("%d server applyCh msg = %v\n", kv.me, msg)
+
+				if command.Op == "Get" {
+					command.Value = kv.kv[command.Key]
+					_, _ = DPrintf("%d server applyCh msg = %v, value = %v\n", kv.me, msg, command.Value)
+				}
+
+				v, ok := kv.LastTaskID[command.ClientID]
+				if ok {
+					if command.TaskID > v {
+						switch command.Op {
+						case "Append":
+							kv.kv[command.Key] += command.Value
+
+						case "Put":
+							kv.kv[command.Key] = command.Value
+						}
+
+						kv.LastTaskID[command.ClientID] = command.TaskID
+					}
+				}
+
+				if _, isLeader := kv.rf.GetState(); isLeader {
+					kv.GetApplyChanForCommitID(msg.CommandIndex) <- command
+				}
+
+				kv.mu.Unlock()
+			}
 		}
 	}
 }
@@ -230,13 +260,24 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.kv = make(map[string]string)
-	kv.done = make(map[int64]bool)
-
+	kv.LastTaskID = make(map[int]int)
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyChan = make(map[int]chan Op)
+
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	//go kv.apply()
+	go kv.apply()
 
 	return kv
+}
+
+func (kv *KVServer) GetApplyChanForCommitID(index int) chan Op {
+	ch, ok := kv.applyChan[index]
+	if !ok {
+		kv.applyChan[index] = make(chan Op, 1)
+		ch = kv.applyChan[index]
+	}
+	_, _ = DPrintf("server:%d create chan for index:%d \n", kv.me, index)
+	return ch
 }
