@@ -1,35 +1,14 @@
 package raft
 
-//
-// this is an outline of the API that raft must expose to
-// the service (or tester). see comments below for
-// each of these functions for more details.
-//
-// rf = Make(...)
-//   创建一个新的Raft服务器
-// rf.Start(command interface{}) (index, term, isLeader)
-//   start agreement on a new log entry
-//	 启动对新日志条目的协议
-// rf.GetState() (term, isLeader)
-//   询问Raft的当前任期，以及它是否认为自己是领导者
-// applyMsg
-//   each time a new entry is committed to the log, each Raft peer should
-//   send an applyMsg to the service (or tester) in the same server.
-// 	 每次向日志提交新条目时，每个Raft对等体都应该向同一服务器中的服务（或测试人员）发送ApplyMsg
-//
-
 import (
 	"6.824/labgob"
+	"6.824/labrpc"
 	"bytes"
 	"context"
 	"math/rand"
-	//	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	//	"6.824/labgob"
-	"6.824/labrpc"
 )
 
 const (
@@ -52,6 +31,7 @@ const (
 // 在第2D部分中，您将希望在applyCh上发送其他类型的消息（例如快照），
 // but set CommandValid to false for these other uses.
 // 但是对于这些其他用途，将CommandValid设置为false。
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -85,6 +65,7 @@ type InstallSnapshotReply struct {
 }
 
 // Raft 实现单个Raft对等体的Go对象。
+
 type Raft struct {
 	mu        sync.Mutex          // 锁定以保护对此对等状态的共享访问
 	peers     []*labrpc.ClientEnd // 所有对等端的RPC端点
@@ -128,6 +109,7 @@ type Raft struct {
 }
 
 // GetState return currentTerm，以及此服务器是否认为自己是leader。
+
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
@@ -138,6 +120,7 @@ func (rf *Raft) GetState() (int, bool) {
 // 将Raft的持久状态保存到稳定存储中，
 // 在那里它可以稍后在崩溃和重新启动之后被检索。
 // 关于什么应该是持久性的描述，请参见本文的图2。
+
 func (rf *Raft) persistL() {
 	// Your code here (2C).
 	// Example:
@@ -149,11 +132,13 @@ func (rf *Raft) persistL() {
 	e.Encode(rf.LastIncludedTerm)
 	e.Encode(rf.LastIncludedIndex)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	//rf.persister.SaveRaftState(data) 7-15
+	rf.persister.SaveStateAndSnapshot(data, rf.persister.ReadSnapshot())
 	_, _ = DPrintf("持久化状态成功\n")
 }
 
 // 恢复以前的持久状态。
+
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -162,6 +147,7 @@ func (rf *Raft) readPersist(data []byte) {
 	// Example:
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
+
 	var currentTerm int
 	var voteFor int
 	var log []LogEntries
@@ -190,6 +176,7 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 // CondInstallSnapshot 服务希望切换到快照。只有当Raft在applyCh上传递快照后没有更新的信息时才这样做。
+
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	// Your code here (2D).
 	return true
@@ -201,6 +188,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // 该服务表示，它已经创建了一个快照，其中包含索引之前的所有信息
 // 这意味着服务不再需要通过（包括）该索引进行日志记录
 // raft现在应该尽可能多地修剪log
+
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	//Your code here (2D).
 	rf.mu.Lock()
@@ -229,6 +217,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 // RequestVoteArgs 示例RequestVote RPC参数结构。
 // 字段名称必须以大写字母开头！
+
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int // 候选人的任期号
@@ -239,6 +228,7 @@ type RequestVoteArgs struct {
 
 // RequestVoteReply RequestVote RPC回复结构示例。
 // 字段名称必须以大写字母开头！
+
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int  // 当前任期号，候选人会更新自己的任期号
@@ -272,6 +262,7 @@ func (rf *Raft) GetLatestLogIndexAndTerm() (int, int) {
 // RequestVote RPC处理程序示例
 // 如果term < currentTerm，则返回false
 // 如果VotedFor是nil/candidateID，且候选人日志至少和接收人的日志一样新，则投票
+
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
@@ -485,8 +476,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
-	rf.resetChan <- 1
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -505,6 +494,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			_, _ = DPrintf("旧leader:%d 转变为follower\n", rf.me)
 		}
 	}
+
+	rf.resetChan <- 1 // pass
 
 	// 相同的快照直接返回
 	if args.LastIncludedIndex == rf.LastIncludedIndex {
@@ -612,6 +603,7 @@ func (rf *Raft) apply() {
 // and that the caller passes the address of the reply struct with &, not the struct itself.
 // 如果您在使RPC工作时遇到问题，请检查您是否已将通过RPC传递的结构中的所有字段名大写，并且调用者是否使用&传递回复结构的地址，而不是结构本身。
 // flag 为true时，胜选变为leader
+
 func (rf *Raft) sendRequestVote(server int, hadVote *sync.Map, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	rf.mu.Lock()
 
@@ -701,6 +693,7 @@ func (rf *Raft) sendRequestVote(server int, hadVote *sync.Map, args *RequestVote
 }
 
 // leader 这里是leader定时发送心跳，只有leader一个go程执行
+
 func (rf *Raft) sendHeartOrAppend() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -769,6 +762,7 @@ func (rf *Raft) sendHeartOrAppend() bool {
 }
 
 // leader
+
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
@@ -912,6 +906,7 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 // 第二个返回值是当前任期。
 // the third return value is true if this server believes it is the leader.
 // 如果此服务器认为它是领导者，则第三个返回值为true。
+
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term, isLeader := rf.GetState()
 
@@ -958,6 +953,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // 可能会导致以后的测试失败，并生成令人困惑的调试输出。
 // any goroutine with a long-running loop should call killed() to check whether it should stop.
 // 任何具有长时间运行循环的goroutine都应该调用killed（）来检查它是否应该停止。
+
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
@@ -986,6 +982,7 @@ func randomDuration() time.Duration {
 
 // The ticker go routine starts a new election if this peer hasn't received heartsBeats recently.
 // 如果这位同行最近没有收到心跳，那么自动投票程序将开始新的选举。
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here to check if a leader election should
@@ -1081,6 +1078,7 @@ func (rf *Raft) ticker() {
 // Make() must return quickly, so it should start goroutines for any long-running work.
 // Make()必须快速返回，所以它应该为任何长时间运行的工作启动goroutines。
 func Make(peers []*labrpc.ClientEnd, me int,
+
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
