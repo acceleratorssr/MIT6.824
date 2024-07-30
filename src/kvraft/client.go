@@ -64,7 +64,7 @@ func (ck *Clerk) Get(key string) string {
 			ck.LastLeader = i
 			ck.LastTaskID++
 
-			return reply.Value
+			return reply.Value // 没找到时，直接返回""
 		}
 	}
 	// You will have to modify this function.

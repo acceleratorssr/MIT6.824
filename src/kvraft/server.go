@@ -4,7 +4,8 @@ package kvraft
 import (
 	"6.824/labgob"
 	"6.824/labrpc"
-	raft "6.824/test"
+	"6.824/raft"
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -91,7 +92,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	select {
 	case msg := <-ch:
 		if msg.TaskID == logValue.TaskID && msg.ClientID == logValue.ClientID {
-			_, _ = DPrintf("server:%d [%s]%s \n", kv.me, args.Key, kv.kv[args.Key])
+			//_, _ = DPrintf("server:%d [%s]%s \n", kv.me, args.Key, kv.kv[args.Key])
 			reply.Value = msg.Value
 			reply.Err = OK
 			return
@@ -185,7 +186,7 @@ func (kv *KVServer) apply() {
 				_, _ = DPrintf("server:%d CommitID=%d\n", kv.me, msg.CommandIndex)
 
 				if command.Op == "Get" {
-					command.Value = kv.kv[command.Key]
+					command.Value = kv.kv[command.Key] //没找到时，直接返回""
 					_, _ = DPrintf("server:%d CommitID=%d\n", kv.me, msg.CommandIndex)
 				}
 
@@ -210,7 +211,19 @@ func (kv *KVServer) apply() {
 					kv.GetApplyChanForCommitID(msg.CommandIndex) <- command
 					_, _ = DPrintf("server:%d CommitID=%d; chan start\n", kv.me, msg.CommandIndex)
 				}
+				if kv.maxraftstate != -1 && kv.rf.RaftStateSize() >= kv.maxraftstate {
+					DPrintf("server:%d SaveSnapshot, index = %d\n", kv.me, msg.CommandIndex)
+					kv.rf.Snapshot(msg.CommandIndex, kv.SaveSnapshot())
+				}
 
+				kv.mu.Unlock()
+			}
+
+			if msg.SnapshotValid {
+				kv.mu.Lock()
+
+				kv.ReadSnapshotL(msg.Snapshot)
+				kv.lastCommitID = max(msg.SnapshotIndex, kv.lastCommitID)
 				kv.mu.Unlock()
 			}
 		}
@@ -274,7 +287,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyChan = make(map[int]chan Op)
 	kv.lastCommitID = -1
 
+	//kv.rf.
+
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	kv.mu.Lock()
+	kv.ReadSnapshotL(persister.ReadSnapshot())
+	kv.mu.Unlock()
 
 	// You may need initialization code here.
 	go kv.apply()
@@ -290,4 +309,30 @@ func (kv *KVServer) GetApplyChanForCommitID(index int) chan Op {
 	}
 	_, _ = DPrintf("server:%d create chan for index:%d \n", kv.me, index)
 	return ch
+}
+
+func (kv *KVServer) SaveSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kv)
+	e.Encode(kv.LastTaskID)
+	return w.Bytes()
+}
+
+func (kv *KVServer) ReadSnapshotL(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var kvMap map[string]string
+	var lastTaskID map[int64]int
+	if d.Decode(&kvMap) != nil || d.Decode(&lastTaskID) != nil {
+		_, _ = DPrintf("readSnapshot -> Decode error\n")
+	} else {
+		kv.kv = kvMap
+		kv.LastTaskID = lastTaskID
+	}
 }

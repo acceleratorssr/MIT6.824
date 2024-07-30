@@ -382,12 +382,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	var index int
 
 	// 此时的前一日志的匹配只能通过pre进行，因为真实日志已经被压缩到快照内了
-	if args.PrevLogIndex == rf.LastIncludedIndex {
+	if args.PrevLogIndex <= rf.LastIncludedIndex {
 		term = rf.LastIncludedTerm
 		index = rf.LastIncludedIndex
 		_, _ = DPrintf("args.PrevLogIndex == rf.LastIncludedIndex\n")
 	} else {
 		term = rf.Log[args.PrevLogIndex-rf.LastIncludedIndex-1].TermID
+		//term = rf.Log[0].TermID
 		index = rf.Log[0].LogID
 	}
 
@@ -405,9 +406,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		if len(rf.Log) != 0 {
 			for i := index; i <= args.PrevLogIndex; i++ {
-				if rf.Log[i-rf.LastIncludedIndex-1].TermID == reply.ConflictTerm {
-					reply.ConflictFirstIndex = i
-					break
+				if i >= rf.LastIncludedIndex+1 {
+					if rf.Log[i-rf.LastIncludedIndex-1].TermID == reply.ConflictTerm {
+						reply.ConflictFirstIndex = i
+						break
+					}
 				}
 			}
 		} else {
@@ -424,9 +427,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 如果leader发来的日志，就是当前follower拥有的最新日志，这里先这样处理：直接返回false
 	// len(rf.Log) 是follower将存放新日志的位置，args.PrevLogIndex+1 是将要追加的新日志期望存放的位置
 	cnt := 0 //重复的日志条目数量
-	if args.Entries != nil {
+	if args.Entries != nil && args.PrevLogIndex+1 >= rf.LastIncludedIndex+1 {
 		for i := 0; i < len(args.Entries); i++ {
-			if latestLogIndex >= args.PrevLogIndex+1+i && args.Entries[i].TermID != rf.Log[args.PrevLogIndex+1+i-rf.LastIncludedIndex-1].TermID {
+			if latestLogIndex >= args.PrevLogIndex+1+i &&
+				args.Entries[i].TermID != rf.Log[args.PrevLogIndex+1+i-rf.LastIncludedIndex-1].TermID {
 				_, _ = DPrintf("server:%d 一个现有的条目任期%d 与一个新的条目任期%d 相冲突\n", rf.me, rf.Log[args.PrevLogIndex+1+i-rf.LastIncludedIndex-1].TermID, args.Entries[i].TermID)
 				rf.Log = rf.Log[:args.PrevLogIndex+1+i-rf.LastIncludedIndex-1]
 				_, _ = DPrintf("server:%d 日志:%v\n", rf.me, rf.Log)
@@ -667,7 +671,7 @@ func (rf *Raft) sendRequestVote(server int, hadVote *sync.Map, args *RequestVote
 				rf.sendHeartOrAppend()
 				for {
 					select {
-					case <-time.After(100 * time.Millisecond):
+					case <-time.After(30 * time.Millisecond):
 						rf.sendHeartOrAppend()
 					case <-rf.ctx.Done():
 						_, _ = DPrintf("leader:%d 停止发送心跳包\n", rf.me)
@@ -746,9 +750,8 @@ func (rf *Raft) sendHeartOrAppend() bool {
 		reply := AppendEntriesReply{}
 
 		if args.PrevLogIndex < latestLogIndex {
-			args.Entries = make([]LogEntries, latestLogIndex-rf.NextIndex[i]+1)
-			copy(args.Entries, rf.Log[rf.NextIndex[i]-rf.LastIncludedIndex-1:])
-
+			args.Entries = make([]LogEntries, 0, latestLogIndex-rf.NextIndex[i]+1)
+			args.Entries = append(args.Entries, rf.Log[rf.NextIndex[i]-rf.LastIncludedIndex-1:]...)
 			_, _ = DPrintf("Leader:%d 发现server:%d, 日志落后，现在可能需要日志:%d, 本身日志数量%d\n", rf.me, i, rf.NextIndex[i], len(rf.Log))
 
 			go rf.sendAppendEntries(i, &args, &reply)
@@ -841,15 +844,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		} else {
 			var i int
 
-			// 找冲突任期的第一个日志
-			for i = args.PrevLogIndex; i > 0 && rf.Log[i-rf.LastIncludedIndex-1].TermID >= reply.ConflictTerm; i-- {
+			// 找冲突任期的第一个日志i > 0 &&
+			for i = args.PrevLogIndex; i >= rf.LastIncludedIndex+1 && rf.Log[i-rf.LastIncludedIndex-1].TermID >= reply.ConflictTerm; i-- {
 				if rf.Log[i-rf.LastIncludedIndex-1].TermID == reply.ConflictTerm {
 					rf.NextIndex[server] = i + 1
 					break
 				}
 			}
 
-			if rf.Log[i-rf.LastIncludedIndex-1].TermID < reply.ConflictTerm {
+			if i >= rf.LastIncludedIndex+1 && rf.Log[i-rf.LastIncludedIndex-1].TermID < reply.ConflictTerm {
 				rf.NextIndex[server] = reply.ConflictFirstIndex
 			}
 		}
@@ -1030,6 +1033,7 @@ func (rf *Raft) ticker() {
 		hadVote.Store(rf.me, 1)
 
 		// 胜选、身份转变、选举超时，后终止该goroutine
+		// 多次发送投票
 		go func() {
 			for {
 				for i := range len(rf.peers) {
@@ -1078,7 +1082,6 @@ func (rf *Raft) ticker() {
 // Make() must return quickly, so it should start goroutines for any long-running work.
 // Make()必须快速返回，所以它应该为任何长时间运行的工作启动goroutines。
 func Make(peers []*labrpc.ClientEnd, me int,
-
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
@@ -1122,4 +1125,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.apply()
 
 	return rf
+}
+
+func (rf *Raft) RaftStateSize() int {
+	return rf.persister.RaftStateSize()
 }
