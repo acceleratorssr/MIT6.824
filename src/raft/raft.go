@@ -671,7 +671,7 @@ func (rf *Raft) sendRequestVote(server int, hadVote *sync.Map, args *RequestVote
 				rf.sendHeartOrAppend()
 				for {
 					select {
-					case <-time.After(30 * time.Millisecond):
+					case <-time.After(50 * time.Millisecond):
 						rf.sendHeartOrAppend()
 					case <-rf.ctx.Done():
 						_, _ = DPrintf("leader:%d 停止发送心跳包\n", rf.me)

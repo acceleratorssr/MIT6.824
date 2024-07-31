@@ -1,6 +1,5 @@
 package kvraft
 
-//
 import (
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -101,7 +100,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = Err(fmt.Sprintf("server:%d commond error:%v \n", kv.me, msg))
 		}
 
-	case <-time.After(1 * time.Second): //可能是leader过时了
+	case <-time.After(100 * time.Millisecond): //可能是leader过时了
 		_, _ = DPrintf("server:%d 超时\n", kv.me)
 		reply.Err = ErrTimeOut
 	}
@@ -159,7 +158,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		//DPrintf("PutAppend kvMap = %v,replyErr = %v\n", kv.kvMap, reply.Err)
 
 	//case <-time.After(100 * time.Millisecond):
-	case <-time.After(1 * time.Second):
+	case <-time.After(100 * time.Millisecond):
 		reply.Err = ErrTimeOut
 	}
 
@@ -239,6 +238,7 @@ func (kv *KVServer) apply() {
 // code to Kill(). you're not required to do anything
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
+
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
@@ -271,6 +271,7 @@ func (kv *KVServer) killed() bool {
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
 // StartKVServer（）必须快速返回，因此它应该为任何长时间运行的工作启动goroutines。
+
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.

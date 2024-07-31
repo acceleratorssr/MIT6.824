@@ -1,8 +1,8 @@
 #!/bin/bash
 
-max_attempts=20
+max_attempts=10
 attempts=0
-num_parallel_tests=4
+num_parallel_tests=1
 
 # 创建临时文件来存储成功计数和总持续时间
 success_file=$(mktemp)
