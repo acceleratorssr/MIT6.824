@@ -3,9 +3,9 @@ lab1、2、3及课程笔记：https://www.yuque.com/u32495242/hqyqhm/tu2545e0ml3
 
 博客：https://acceleratorssr.github.io/
 
-lab2单次测试结果：[go_race_test_6_824_raft.html](go_race_test_6_824_raft.html)
+lab2单次测试结果：[go_race_test_6_824_raft.html](https://acceleratorssr.github.io/pages/go_race_test_6_824_raft.html)
 
-lab3单次测试结果：[go_race_test_6_824_kvraft.html](go_race_test_6_824_kvraft.html)
+lab3单次测试结果：[go_race_test_6_824_kvraft.html](https://acceleratorssr.github.io/pages/go_race_test_6_824_kvraft.html)
 
 # 说明
 具体逻辑或者小优化就不展示了，条条大路通罗马，不同实现方案的倾向都不一样；
