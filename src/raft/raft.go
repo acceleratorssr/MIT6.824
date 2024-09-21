@@ -249,7 +249,6 @@ type AppendEntriesReply struct {
 	Success            bool // 如果日志条目顺序匹配，则返回true
 	ConflictTerm       int  //冲突的term
 	ConflictFirstIndex int  //该term的第一个日志的index值
-	NeedSnapshot       bool
 }
 
 func (rf *Raft) GetLatestLogIndexAndTerm() (int, int) {
@@ -336,7 +335,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.resetChan <- 1 // 先刷新计时？
+	rf.resetChan <- 1 // 先刷新计时
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -669,9 +668,11 @@ func (rf *Raft) sendRequestVote(server int, hadVote *sync.Map, args *RequestVote
 				rf.wg.Add(1)
 				defer rf.wg.Done()
 				rf.sendHeartOrAppend()
+				ticker := time.NewTicker(100 * time.Millisecond)
+				defer ticker.Stop()
 				for {
 					select {
-					case <-time.After(50 * time.Millisecond):
+					case <-ticker.C:
 						rf.sendHeartOrAppend()
 					case <-rf.ctx.Done():
 						_, _ = DPrintf("leader:%d 停止发送心跳包\n", rf.me)
@@ -823,20 +824,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	// 返回false的处理
 	// 此时返回的false可能是因为leader任期小于follower，或者follower日志不够新需要回退
 	if !reply.Success && reply.Term == rf.CurrentTerm && args.Term == rf.CurrentTerm {
-		if reply.NeedSnapshot {
-			argsSnapshot := InstallSnapshotArgs{
-				Term:              rf.CurrentTerm,
-				LeaderId:          rf.me,
-				LastIncludedIndex: rf.LastIncludedIndex,
-				LastIncludedTerm:  rf.LastIncludedTerm,
-				Data:              rf.persister.ReadSnapshot(),
-			}
-			replySnapshot := InstallSnapshotReply{}
-			_, _ = DPrintf("leader:%d follower%d当PrevLogIndex & lastincludeindex不匹配时\n", rf.me, server)
-			go rf.sendInstallSnapshot(server, &argsSnapshot, &replySnapshot)
-			return false
-		}
-
 		// 回退日志
 		if reply.ConflictTerm == -1 {
 			// 这里的 ConflictFirstIndex 应该是follower已经拥有的最后一个日志的index
